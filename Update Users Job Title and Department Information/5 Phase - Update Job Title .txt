@@ -1,0 +1,601 @@
+<#
+.SYNOPSIS
+    Bulk-update Entra ID user profile fields (First/Last/Display name, Job Title, Department)
+    from an Excel or CSV input, skipping blank cells and values that already match.
+
+.DESCRIPTION
+    For each row keyed by UserPrincipalName, the script reads the current user object from
+    Microsoft Graph and only writes fields where:
+        - the input cell is NOT blank, AND
+        - the input value differs from the current value in Entra.
+    Blank input cells are left untouched. Cells that already match the tenant value are skipped.
+    A whole row is skipped if nothing needs changing. Supports a DryRun (preview only) mode.
+
+    This is a copy-paste-into-terminal PowerShell 7 script structured in the mandatory 5 phases.
+    You can run the whole file, or paste it phase-by-phase into ONE PowerShell 7 session.
+
+.AUTHOR         Generated with Claude for Rakso CT Education IT.
+.VERSION        1.0.0
+.DATE           2026-07-30
+.REQUIREMENTS   PowerShell 7+; Microsoft.Graph.Authentication, Microsoft.Graph.Users.
+                ImportExcel (only when the input is .xlsx/.xls/.xlsm).
+.PERMISSIONS    Delegated Graph scope: User.ReadWrite.All (read current values + write profile fields).
+.SAFETY         DryRun mode + Y/N confirmation in Phase 4. Only differing, non-blank fields are written.
+.CHANGELOG      v1.0.0 - Initial 5-phase release (refactor of legacy USER MANAGEMENT update script).
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# Initialise globals up front so StrictMode never trips on them.
+$Global:CorrelationId = ''
+$Global:JsonLogFile   = $null
+
+# =====================================================================================
+# PHASE 0 - HELPERS  (paste this block first; every later phase depends on it)
+# =====================================================================================
+
+function Sanitize-Path {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $p = $Path.Trim().Trim('"').Trim("'")
+    $invisible = @([char]0x00A0,[char]0x202A,[char]0x202B,[char]0x202C,[char]0x202D,
+                   [char]0x202E,[char]0x200E,[char]0x200F,[char]0xFEFF,[char]0x200B)
+    foreach ($c in $invisible) { $p = $p.Replace([string]$c,'') }
+    return $p.Trim()
+}
+
+function Sanitize-Upn {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return @{ Clean=''; Changed=$true; Reason='Empty or whitespace-only' }
+    }
+
+    $raw = $Value
+    # NFD normalise then strip combining marks (e-acute -> e, n-tilde -> n)
+    $nfd = $raw.Normalize([Text.NormalizationForm]::FormD)
+    $sb  = [Text.StringBuilder]::new()
+    foreach ($ch in $nfd.ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne [Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$sb.Append($ch)
+        }
+    }
+    $s = $sb.ToString()
+
+    $invisible = @(
+        [char]0x00A0,[char]0x1680,[char]0x2000,[char]0x2001,[char]0x2002,[char]0x2003,
+        [char]0x2004,[char]0x2005,[char]0x2006,[char]0x2007,[char]0x2008,[char]0x2009,
+        [char]0x200A,[char]0x200B,[char]0x200C,[char]0x200D,[char]0x200E,[char]0x200F,
+        [char]0x202A,[char]0x202B,[char]0x202C,[char]0x202D,[char]0x202E,
+        [char]0x202F,[char]0x205F,[char]0x2060,[char]0x3000,[char]0xFEFF
+    )
+    foreach ($c in $invisible) { $s = $s.Replace([string]$c,'') }
+    $s = $s -replace '\p{C}',''          # control chars
+    $s = $s.Trim().ToLowerInvariant()
+
+    $changed = ($s -ne $raw)
+    $reason  = if ($changed) { 'Sanitized' } else { 'Unchanged' }
+
+    if ($s -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        return @{ Clean=$s; Changed=$changed; Reason='Invalid UPN format' }
+    }
+    if ($s.Length -gt 113) {
+        return @{ Clean=$s; Changed=$changed; Reason='Exceeds 113-char Entra limit' }
+    }
+    return @{ Clean=$s; Changed=$changed; Reason=$reason }
+}
+
+function Ensure-Module {
+    param([Parameter(Mandatory)][string]$Name, [string]$MinVersion)
+
+    $existing = Get-Module -ListAvailable -Name $Name |
+                Sort-Object Version -Descending | Select-Object -First 1
+
+    if ($existing) {
+        if ($MinVersion -and ($existing.Version -lt [version]$MinVersion)) {
+            Write-Host "[WARN] $Name $($existing.Version) is older than required $MinVersion." -ForegroundColor Yellow
+            $ans = Read-Host "Uninstall all versions and reinstall clean? (Y/N)"
+            if ($ans -notmatch '^(y|yes)$') { return $false }
+            try {
+                Get-InstalledModule "$Name*" -AllVersions -ErrorAction SilentlyContinue |
+                    Uninstall-Module -Force -ErrorAction SilentlyContinue
+                Install-Module $Name -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            } catch {
+                Write-Host "[FAIL] Reinstall of $Name failed: $($_.Exception.Message)" -ForegroundColor Red
+                return $false
+            }
+        }
+        Import-Module $Name -ErrorAction Stop
+        return $true
+    }
+
+    Write-Host "[MISSING] Module $Name is not installed." -ForegroundColor Yellow
+    $ans = Read-Host "Install $Name from PSGallery now? (Y/N)"
+    if ($ans -notmatch '^(y|yes)$') { return $false }
+    try {
+        Install-Module $Name -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        Import-Module $Name -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Host "[FAIL] Install of $Name failed: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Invoke-GraphWithRetry {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [int]$MaxAttempts = 5,
+        [int]$BaseDelaySeconds = 2
+    )
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        try { return & $Action }
+        catch {
+            $status = $null; $retryAfter = $null
+            $ex = $_.Exception
+            # StrictMode-safe probe for an HTTP response object.
+            $respProp = $ex.PSObject.Properties['Response']
+            if ($respProp -and $respProp.Value) {
+                $resp = $respProp.Value
+                $scProp = $resp.PSObject.Properties['StatusCode']
+                if ($scProp -and $null -ne $scProp.Value) { $status = [int]$scProp.Value }
+                $hdrProp = $resp.PSObject.Properties['Headers']
+                if ($hdrProp -and $hdrProp.Value) {
+                    try {
+                        $vals = $null
+                        if ($hdrProp.Value.TryGetValues('Retry-After', [ref]$vals)) {
+                            $retryAfter = [int]($vals | Select-Object -First 1)
+                        }
+                    } catch { }
+                }
+            }
+            if ($null -eq $status) {
+                if ($_.ErrorDetails.Message -match 'TooManyRequests' -or $ex.Message -match '\b429\b') { $status = 429 }
+            }
+            $isRetryable = $status -in 429,500,502,503,504
+            if (-not $isRetryable -or $i -eq $MaxAttempts) { throw }
+            $delay = if ($retryAfter) { $retryAfter } else { [int][Math]::Pow($BaseDelaySeconds, $i) }
+            Write-Host "[RETRY $i/$MaxAttempts] HTTP $status - sleeping ${delay}s..." -ForegroundColor DarkYellow
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet('INFO','WARN','ERROR','SUCCESS','AUDIT','SECURITY')][string]$Level='INFO'
+    )
+    $ts   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+    $line = "$ts [$Level] [$Global:CorrelationId] $Message"
+    $color = @{INFO='Gray';WARN='Yellow';ERROR='Red';SUCCESS='Green';AUDIT='Cyan';SECURITY='Magenta'}[$Level]
+    Write-Host $line -ForegroundColor $color
+    if ($Global:JsonLogFile) {
+        $obj = [ordered]@{ ts=$ts; level=$Level; correlationId=$Global:CorrelationId; message=$Message }
+        ($obj | ConvertTo-Json -Compress) | Add-Content -LiteralPath $Global:JsonLogFile -Encoding UTF8
+    }
+}
+
+function Import-InputFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if ($ext -in '.xlsx','.xls','.xlsm') {
+        if (-not (Ensure-Module -Name 'ImportExcel')) {
+            throw "ImportExcel module is required to read '$ext' files but was not installed."
+        }
+        return @(Import-Excel -Path $Path)   # ImportExcel has no -LiteralPath; avoid bracketed paths for xlsx.
+    }
+    # Text file: sniff delimiter from the header line.
+    $firstLine = Get-Content -LiteralPath $Path -TotalCount 1 -Encoding UTF8
+    $delim = ','
+    if ($firstLine -match "`t") { $delim = "`t" }
+    elseif (($firstLine -split ';').Count -gt ($firstLine -split ',').Count) { $delim = ';' }
+    return @(Import-Csv -LiteralPath $Path -Delimiter $delim -Encoding UTF8)
+}
+
+# Safe cell reader: returns $null if the header/column does not exist (avoids StrictMode throws).
+function Get-Cell {
+    param($Row, [string]$Column, [string[]]$Available)
+    if ($Available -contains $Column) {
+        $v = $Row.$Column
+        if ($null -ne $v) { return [string]$v }
+    }
+    return $null
+}
+
+# Which CSV/Excel headers map to which Graph user property (order = update order).
+$FieldMap = @(
+    [pscustomobject]@{ Csv='First name';   Graph='GivenName'   }
+    [pscustomobject]@{ Csv='Last name';    Graph='Surname'     }
+    [pscustomobject]@{ Csv='Display name'; Graph='DisplayName' }
+    [pscustomobject]@{ Csv='Title';        Graph='JobTitle'    }
+    [pscustomobject]@{ Csv='Department';   Graph='Department'  }
+)
+$UpnHeader = 'User principal name'
+
+Write-Host "[OK] Helpers loaded." -ForegroundColor Green
+
+
+# =====================================================================================
+# PHASE 1 - CONFIGURE PATHS
+# =====================================================================================
+
+$Global:CorrelationId = [guid]::NewGuid().ToString('N').Substring(0,12)
+$scriptName = 'Bulk-UpdateUserProfileFields'
+
+$defaultInput  = 'C:\Users\hayleyllujah\Downloads\Reports\USER MANAGEMENT.csv'
+$defaultOutDir = 'C:\Users\hayleyllujah\Downloads\Reports'
+
+$inRaw  = Read-Host "Input file path (.csv/.tsv/.xlsx) [default: $defaultInput]"
+$inPath = if ([string]::IsNullOrWhiteSpace($inRaw)) { $defaultInput } else { Sanitize-Path $inRaw }
+
+$outRaw = Read-Host "Output/log folder [default: $defaultOutDir]"
+$outDir = if ([string]::IsNullOrWhiteSpace($outRaw)) { $defaultOutDir } else { Sanitize-Path $outRaw }
+
+if (-not (Test-Path -LiteralPath $inPath)) {
+    Write-Host "[FAIL] Input file not found: $inPath" -ForegroundColor Red
+    return
+}
+if (-not (Test-Path -LiteralPath $outDir)) {
+    try   { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+    catch { Write-Host "[FAIL] Could not create output folder: $($_.Exception.Message)" -ForegroundColor Red; return }
+}
+
+$ts             = Get-Date -Format 'yyyyMMdd_HHmmss'
+$logFile        = Join-Path $outDir "${scriptName}_$ts.csv"
+$failedFile     = Join-Path $outDir "${scriptName}_${ts}_FAILED.csv"
+$Global:JsonLogFile = Join-Path $outDir "${scriptName}_$ts.jsonl"
+$transcriptFile = Join-Path $outDir "${scriptName}_${ts}_transcript.log"
+
+try { Start-Transcript -LiteralPath $transcriptFile -Force | Out-Null } catch { }
+
+Write-Log "Correlation ID : $Global:CorrelationId" 'AUDIT'
+Write-Log "Input file     : $inPath" 'INFO'
+Write-Log "Log CSV        : $logFile" 'INFO'
+
+
+# =====================================================================================
+# PHASE 2 - CONNECT TO MICROSOFT GRAPH + SELECT SCOPE
+# =====================================================================================
+
+if (-not (Ensure-Module -Name 'Microsoft.Graph.Authentication')) { return }
+if (-not (Ensure-Module -Name 'Microsoft.Graph.Users'))          { return }
+
+$scopes = @('User.ReadWrite.All')   # read current values + write profile fields
+Write-Log "Requesting delegated scope(s): $($scopes -join ', ')" 'SECURITY'
+
+$tenantRaw = Read-Host "Tenant ID (GUID) or domain (e.g. gscs95.edu.ph) [Enter to skip]"
+$tenantId  = Sanitize-Path $tenantRaw
+if ($tenantId -and $tenantId -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -and $tenantId -notmatch '\.') {
+    Write-Host "[FAIL] '$tenantId' is neither a GUID nor a domain." -ForegroundColor Red
+    return
+}
+
+Write-Host ""
+Write-Host "Sign-in mode:" -ForegroundColor Cyan
+Write-Host "  [1] Browser session / DeviceCode flow (default)"
+Write-Host "  [2] Interactive popup"
+Write-Host "  [3] Reuse existing session"
+$mode = Read-Host "Choose (1/2/3)"
+if ([string]::IsNullOrWhiteSpace($mode)) { $mode = '1' }
+
+$connectArgs = @{ Scopes = $scopes; NoWelcome = $true }
+if ($tenantId) { $connectArgs['TenantId'] = $tenantId }
+
+try {
+    switch ($mode) {
+        '3' {
+            $existing = $null
+            try { $existing = Get-MgContext } catch { }
+            if (-not $existing) {
+                Write-Host "[INFO] No existing session; falling back to DeviceCode." -ForegroundColor Yellow
+                Connect-MgGraph @connectArgs -UseDeviceCode
+            } else {
+                Write-Host "[INFO] Reusing existing Graph session." -ForegroundColor Gray
+            }
+        }
+        '2' { Connect-MgGraph @connectArgs }
+        default { Connect-MgGraph @connectArgs -UseDeviceCode }
+    }
+} catch {
+    Write-Host "[FAIL] Connect-MgGraph failed: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+$ctx = Get-MgContext
+if (-not $ctx -or [string]::IsNullOrWhiteSpace($ctx.TenantId) -or [string]::IsNullOrWhiteSpace($ctx.Account)) {
+    Write-Host "[FAIL] Graph context is incomplete. Aborting." -ForegroundColor Red
+    return
+}
+Write-Log "Connected. Tenant=$($ctx.TenantId)  Account=$($ctx.Account)" 'AUDIT'
+
+
+# =====================================================================================
+# PHASE 3 - VERIFY INPUT CONTENTS
+# =====================================================================================
+
+$rows = @()
+try { $rows = Import-InputFile -Path $inPath }
+catch { Write-Host "[FAIL] Could not read input: $($_.Exception.Message)" -ForegroundColor Red; return }
+
+if ($rows.Count -eq 0) { Write-Host "[FAIL] Input has 0 rows." -ForegroundColor Red; return }
+
+$headers = @($rows[0].PSObject.Properties.Name)
+Write-Log "Loaded $($rows.Count) row(s). Headers: $($headers -join ' | ')" 'INFO'
+
+if ($headers -notcontains $UpnHeader) {
+    Write-Host "[FAIL] Required column '$UpnHeader' is missing." -ForegroundColor Red
+    return
+}
+
+$presentDataCols = @($FieldMap | Where-Object { $headers -contains $_.Csv } | ForEach-Object { $_.Csv })
+if ($presentDataCols.Count -eq 0) {
+    Write-Host "[FAIL] None of the updatable columns are present: $($FieldMap.Csv -join ', ')." -ForegroundColor Red
+    return
+}
+Write-Log "Updatable columns present: $($presentDataCols -join ', ')" 'INFO'
+
+# Drop trailing / fully-blank rows: a row is usable only if its UPN cell has content.
+$before = $rows.Count
+$rows = @($rows | Where-Object {
+    $u = Get-Cell -Row $_ -Column $UpnHeader -Available $headers
+    -not [string]::IsNullOrWhiteSpace($u)
+})
+$dropped = $before - $rows.Count
+if ($dropped -gt 0) { Write-Log "Dropped $dropped blank/no-UPN row(s). $($rows.Count) usable row(s) remain." 'WARN' }
+if ($rows.Count -eq 0) { Write-Host "[FAIL] No rows with a UserPrincipalName." -ForegroundColor Red; return }
+
+Write-Host "`n--- Preview (first 3 rows) ---" -ForegroundColor Cyan
+$rows | Select-Object -First 3 | Format-Table -AutoSize | Out-String | Write-Host
+
+# Sanitise + validate UPNs; report what changed.
+$upnChanged = 0; $upnBad = 0
+foreach ($r in $rows) {
+    $raw = Get-Cell -Row $r -Column $UpnHeader -Available $headers
+    $res = Sanitize-Upn -Value ([string]$raw)
+    if ($res.Changed -and $res.Reason -eq 'Sanitized') {
+        $upnChanged++
+        $codes = ($res.Clean.ToCharArray() | ForEach-Object { [int][char]$_ }) -join ','
+        Write-Host "[SANITIZED] '$raw' -> '$($res.Clean)'  (codes: $codes)" -ForegroundColor DarkCyan
+    }
+    if ($res.Reason -in 'Invalid UPN format','Exceeds 113-char Entra limit') {
+        $upnBad++
+        Write-Host "[WARN] Row UPN '$raw' -> $($res.Reason)" -ForegroundColor Yellow
+    }
+}
+Write-Log "UPN sanitisation: $upnChanged cleaned, $upnBad flagged as invalid/too-long." 'INFO'
+
+
+# =====================================================================================
+# PHASE 4 - CONFIRMATION
+# =====================================================================================
+
+$processable = @($rows | Where-Object {
+    $u = Get-Cell -Row $_ -Column $UpnHeader -Available $headers
+    -not [string]::IsNullOrWhiteSpace($u)
+}).Count
+
+Write-Host ""
+Write-Host "About to review $processable user(s) and update ONLY fields that are non-blank AND differ." -ForegroundColor Cyan
+Write-Host "Blank cells are left as-is; cells already matching Entra are skipped." -ForegroundColor Cyan
+Write-Host "Fields in scope: $($presentDataCols -join ', ')" -ForegroundColor Cyan
+
+$dry = Read-Host "Run in DRY-RUN (preview only, no writes)? (Y/N)"
+$DryRun = ($dry -match '^(y|yes)$')
+if ($DryRun) { Write-Host "[MODE] DRY-RUN - no changes will be written." -ForegroundColor Magenta }
+
+$go = Read-Host "Proceed? (Y/N)"
+if ($go -notmatch '^(y|yes)$') { Write-Host "[ABORT] Cancelled by user." -ForegroundColor Yellow; return }
+
+
+# =====================================================================================
+# PHASE 5 - EXECUTE + EXPORT LOG
+# =====================================================================================
+
+$results   = [System.Collections.Generic.List[object]]::new()
+$failed    = [System.Collections.Generic.List[object]]::new()
+$plan      = [System.Collections.Generic.List[object]]::new()   # dry-run: previewed changes we can apply later
+$okC=0; $failC=0; $skipC=0; $dryC=0; $retryHits=0
+$total     = $rows.Count
+$idx       = 0
+$lastFlush = 0
+$flushEvery = 100
+$heartbeat  = 25
+$start = Get-Date
+
+# --- One-time directory prefetch (fast lookups; not-found becomes an instant hashtable miss) ---
+Write-Log "Prefetching directory users into memory (one-time)..." 'INFO'
+$dir = @{}
+try {
+    $allUsers = Invoke-GraphWithRetry -Action {
+        Get-MgUser -All -Property 'id','userPrincipalName','displayName','givenName','surname','jobTitle','department' -ErrorAction Stop
+    }
+    foreach ($u in $allUsers) {
+        if ($u.UserPrincipalName) { $dir[$u.UserPrincipalName.ToLowerInvariant()] = $u }
+    }
+    Write-Log "Cached $($dir.Count) directory user(s)." 'INFO'
+} catch {
+    Write-Host "[FAIL] Directory prefetch failed: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+foreach ($r in $rows) {
+    $idx++
+    $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+
+    $rawUpn = Get-Cell -Row $r -Column $UpnHeader -Available $headers
+    $san    = Sanitize-Upn -Value ([string]$rawUpn)
+    $upn    = $san.Clean
+
+    if ([string]::IsNullOrWhiteSpace($upn) -or $san.Reason -in 'Invalid UPN format','Exceeds 113-char Entra limit') {
+        $skipC++
+        $results.Add([pscustomobject]@{
+            Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=([string]$rawUpn)
+            Status='Skipped'; ChangedFields='None'; Changes=''; Message="Invalid/empty UPN ($($san.Reason))"
+        })
+        continue
+    }
+
+    # Look up the user in the prefetched directory (no per-row network call).
+    $user = $dir[$upn]
+    if (-not $user) {
+        $failC++
+        $msg = 'User not found in directory'
+        $failed.Add([pscustomobject]@{
+            Timestamp=$now; UserPrincipalName=$upn
+            FirstName=(Get-Cell $r 'First name' $headers); LastName=(Get-Cell $r 'Last name' $headers)
+            DisplayName=(Get-Cell $r 'Display name' $headers); Title=(Get-Cell $r 'Title' $headers)
+            Department=(Get-Cell $r 'Department' $headers); ErrorMessage=$msg; Status='User Not Found'
+        })
+        $results.Add([pscustomobject]@{
+            Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=$upn
+            Status='Failed'; ChangedFields='None'; Changes=''; Message=$msg
+        })
+        if ($idx % $heartbeat -eq 0) { Write-Host "[HEARTBEAT] Row $idx/$total - OK $okC / FAIL $failC / SKIP $skipC / DRY $dryC" -ForegroundColor DarkGray }
+        continue
+    }
+
+    # Build the update: only non-blank cells that differ from the current value (case-sensitive, trimmed).
+    $updateParams = @{}
+    $changeNotes  = [System.Collections.Generic.List[string]]::new()
+    foreach ($f in $FieldMap) {
+        if ($headers -notcontains $f.Csv) { continue }
+        $newRaw = Get-Cell -Row $r -Column $f.Csv -Available $headers
+        if ([string]::IsNullOrWhiteSpace($newRaw)) { continue }          # blank cell -> keep current
+        $newVal = ([string]$newRaw).Trim()
+        $curVal = if ($null -ne $user.$($f.Graph)) { ([string]$user.$($f.Graph)).Trim() } else { '' }
+        if ($newVal -ceq $curVal) { continue }                            # already matches -> skip field
+        $updateParams[$f.Graph] = $newVal
+        $changeNotes.Add("$($f.Graph): '$curVal' -> '$newVal'")
+    }
+
+    if ($updateParams.Count -eq 0) {
+        $skipC++
+        $results.Add([pscustomobject]@{
+            Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=$upn
+            Status='Skipped'; ChangedFields='None'; Changes=''; Message='No differing, non-blank fields'
+        })
+        if ($idx % $heartbeat -eq 0) { Write-Host "[HEARTBEAT] Row $idx/$total - OK $okC / FAIL $failC / SKIP $skipC / DRY $dryC" -ForegroundColor DarkGray }
+        continue
+    }
+
+    $changedList = ($updateParams.Keys -join ', ')
+    $changesStr  = ($changeNotes -join '; ')
+
+    if ($DryRun) {
+        $dryC++
+        Write-Host "[DRYRUN] $upn => $changesStr" -ForegroundColor Magenta
+        $plan.Add([pscustomobject]@{
+            Upn=$upn; Params=$updateParams; ChangedFields=$changedList; Changes=$changesStr; Row=$r
+        })
+        $results.Add([pscustomobject]@{
+            Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=$upn
+            Status='DryRun'; ChangedFields=$changedList; Changes=$changesStr; Message='Preview only - not written'
+        })
+    } else {
+        try {
+            Invoke-GraphWithRetry -Action { Update-MgUser -UserId $upn @updateParams -ErrorAction Stop } | Out-Null
+            $okC++
+            Write-Host "[OK] $upn => $changesStr" -ForegroundColor Green
+            $results.Add([pscustomobject]@{
+                Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=$upn
+                Status='Success'; ChangedFields=$changedList; Changes=$changesStr; Message='Updated'
+            })
+        } catch {
+            $failC++
+            $msg = $_.Exception.Message
+            Write-Host "[FAIL] $upn - $msg" -ForegroundColor Red
+            $failed.Add([pscustomobject]@{
+                Timestamp=$now; UserPrincipalName=$upn
+                FirstName=(Get-Cell $r 'First name' $headers); LastName=(Get-Cell $r 'Last name' $headers)
+                DisplayName=(Get-Cell $r 'Display name' $headers); Title=(Get-Cell $r 'Title' $headers)
+                Department=(Get-Cell $r 'Department' $headers); ErrorMessage=$msg; Status='Update Failed'
+            })
+            $results.Add([pscustomobject]@{
+                Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=$upn
+                Status='Failed'; ChangedFields=$changedList; Changes=$changesStr; Message=$msg
+            })
+        }
+    }
+
+    if ($idx % $heartbeat -eq 0) {
+        Write-Host "[HEARTBEAT] Row $idx/$total - OK $okC / FAIL $failC / SKIP $skipC / DRY $dryC" -ForegroundColor DarkGray
+    }
+
+    # Periodic flush every 100 rows (append only the new slice; header written on first write).
+    if (($results.Count - $lastFlush) -ge $flushEvery) {
+        $slice = $results.GetRange($lastFlush, $results.Count - $lastFlush)
+        $slice | Export-Csv -LiteralPath $logFile -NoTypeInformation -Encoding UTF8 -Append
+        $lastFlush = $results.Count
+    }
+}
+
+# --- Dry-run fallback: apply the previewed changes LIVE without re-scanning ---
+if ($DryRun -and $plan.Count -gt 0) {
+    Write-Host ""
+    $applyNow = Read-Host "DRY-RUN complete: $($plan.Count) user(s) would change. Apply these LIVE now? (Y/N)"
+    if ($applyNow -match '^(y|yes)$') {
+        Write-Host "[MODE] LIVE APPLY of $($plan.Count) previewed change(s)..." -ForegroundColor Green
+        Write-Log "User approved live apply of $($plan.Count) previewed change(s)." 'AUDIT'
+        $DryRun = $false                       # summary now reports LIVE
+        $ai = 0
+        foreach ($p in $plan) {
+            $ai++
+            $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $upn = $p.Upn; $updateParams = $p.Params; $r = $p.Row
+            try {
+                Invoke-GraphWithRetry -Action { Update-MgUser -UserId $upn @updateParams -ErrorAction Stop } | Out-Null
+                $okC++; $dryC--
+                Write-Host "[OK] $upn => $($p.Changes)" -ForegroundColor Green
+                $results.Add([pscustomobject]@{
+                    Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=$upn
+                    Status='Success'; ChangedFields=$p.ChangedFields; Changes=$p.Changes; Message='Updated (applied from dry-run preview)'
+                })
+            } catch {
+                $failC++; $dryC--
+                $msg = $_.Exception.Message
+                Write-Host "[FAIL] $upn - $msg" -ForegroundColor Red
+                $failed.Add([pscustomobject]@{
+                    Timestamp=$now; UserPrincipalName=$upn
+                    FirstName=(Get-Cell $r 'First name' $headers); LastName=(Get-Cell $r 'Last name' $headers)
+                    DisplayName=(Get-Cell $r 'Display name' $headers); Title=(Get-Cell $r 'Title' $headers)
+                    Department=(Get-Cell $r 'Department' $headers); ErrorMessage=$msg; Status='Update Failed'
+                })
+                $results.Add([pscustomobject]@{
+                    Timestamp=$now; CorrelationId=$Global:CorrelationId; UserPrincipalName=$upn
+                    Status='Failed'; ChangedFields=$p.ChangedFields; Changes=$p.Changes; Message=$msg
+                })
+            }
+            if ($ai % $heartbeat -eq 0) { Write-Host "[HEARTBEAT] Apply $ai/$($plan.Count) - OK $okC / FAIL $failC" -ForegroundColor DarkGray }
+        }
+    } else {
+        Write-Host "[INFO] Preview kept; nothing written." -ForegroundColor Gray
+    }
+}
+
+# Final flush of any remaining rows.
+if ($results.Count -gt $lastFlush) {
+    $slice = $results.GetRange($lastFlush, $results.Count - $lastFlush)
+    $slice | Export-Csv -LiteralPath $logFile -NoTypeInformation -Encoding UTF8 -Append
+}
+if ($failed.Count -gt 0) {
+    $failed | Export-Csv -LiteralPath $failedFile -NoTypeInformation -Encoding UTF8
+}
+
+$dur = (Get-Date) - $start
+Write-Host ""
+Write-Host "=== EXECUTION SUMMARY ===" -ForegroundColor Cyan
+Write-Host ("Correlation ID  : {0}" -f $Global:CorrelationId)
+Write-Host ("Mode            : {0}" -f ($(if ($DryRun) {'DRY-RUN'} else {'LIVE'})))
+Write-Host ("Total rows      : {0}" -f $total)
+Write-Host ("Updated         : {0}" -f $okC)
+Write-Host ("Would-update    : {0}" -f $dryC)
+Write-Host ("Skipped         : {0}" -f $skipC)
+Write-Host ("Failed          : {0}" -f $failC)
+Write-Host ("Duration        : {0:hh\:mm\:ss}" -f $dur)
+Write-Host ("Log file        : {0}" -f $logFile)
+if ($failed.Count -gt 0) { Write-Host ("Failed CSV      : {0}" -f $failedFile) }
+Write-Host "=========================" -ForegroundColor Cyan
+
+try { Stop-Transcript | Out-Null } catch { }
