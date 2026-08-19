@@ -1,0 +1,43 @@
+# ============================================================
+#  EntraID automation - ignore rules
+#  These scripts emit credentials and PII. Nothing they produce
+#  belongs in source control.
+# ============================================================
+
+# --- Secrets: NEVER commit ---
+*_CREDENTIALS_*.csv
+*_INITIAL_PASSWORDS.csv
+*_RESET_PASSWORDS.csv
+*_FAILED_RERUN_*.csv
+*credential*
+*password*
+*secret*
+
+# --- Run output: logs, audit trails, manifests, reports ---
+Logs/
+Reports/
+Auth_Method_logs/
+*_Log_*.csv
+*_FAILED.csv
+*_DryRun_*.csv
+*_RunSummary_*.json
+*.jsonl
+AuthMethodLogs_*.csv
+CreateUsersLog_*.csv
+M365_StorageReport_*.csv
+
+# --- Input data: contains UPNs and often plaintext passwords ---
+# Commit templates only, as *.template.csv
+*.csv
+!*.template.csv
+
+# --- Local overrides ---
+config.json
+config.local.*
+
+# --- OS / editor noise ---
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+.vscode/
