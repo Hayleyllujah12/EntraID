@@ -1,0 +1,1085 @@
+<#
+============================================================
+Bulk Create Student/Faculty Accounts - Phased Execution
+============================================================
+Description:
+- Designed for copy-paste execution into a PowerShell terminal
+- Runs in 5 distinct phases with user confirmation
+- Creates new cloud users in Microsoft Entra ID
+- Assigns an Office 365 license per user, chosen by LicenseGroup (Faculty or Student - you pick the SKU for each group at runtime)
+- Forces password change at next sign-in
+- Optionally updates DisplayName for accounts that already exist (opt-in prompt)
+- Logs all results to a timestamped CSV file
+
+Expected CSV columns (case-sensitive headers):
+  GivenName, Surname, DisplayName, UserPrincipalName, MailNickname, Password, UsageLocation, LicenseGroup, JobTitle, Department
+
+  LicenseGroup must be exactly "Faculty" or "Student" (case-insensitive) - it determines which
+  tenant SKU gets assigned to that row. Rows with a missing/invalid LicenseGroup are skipped.
+
+Requirements:
+- PowerShell 7+
+- Microsoft.Graph.Users + Microsoft.Graph.Identity.DirectoryManagement modules
+- Admin role: User Administrator or Global Administrator
+- Scopes: User.ReadWrite.All, Directory.ReadWrite.All, Organization.Read.All
+
+How to use:
+- Copy and paste each phase one at a time into your PowerShell terminal
+- OR copy and paste the entire script at once
+============================================================
+#>
+
+
+# ============================================================
+# PHASE 1 - Configure Paths (Input CSV + Output Log Folder)
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 1: Configure Paths" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# Defaults (edit or override at prompt)
+$DefaultCsvPath      = "C:\Users\hayleyllujah\OneDrive\Desktop\BULK CREATION ACCOUNT.csv"
+$DefaultLogFolder    = "C:\Users\hayleyllujah\OneDrive\Desktop\Logs"
+$DefaultUsageLocation = "PH"  # ISO 3166-1 alpha-2 fallback, used only if a row's UsageLocation cell is blank
+
+# Helper: strip invisible Unicode formatting chars (LRM/RLM/LRE/RLE/PDF/LRO/RLO/ZWSP/ZWNJ/ZWJ/BOM)
+# that Windows Explorer's "Copy as path" sometimes injects.
+function Remove-InvisibleChars {
+    param([string]$s)
+    if ([string]::IsNullOrEmpty($s)) { return $s }
+    return ($s -replace '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]', '')
+}
+
+Write-Host ""
+Write-Host "Default CSV path:" -ForegroundColor Gray
+Write-Host "  $DefaultCsvPath" -ForegroundColor DarkGray
+$InputCsv = Read-Host "Enter CSV file path (or press Enter to use default)"
+if ([string]::IsNullOrWhiteSpace($InputCsv)) {
+    $CsvPath = $DefaultCsvPath
+} else {
+    $CsvPath = (Remove-InvisibleChars $InputCsv).Trim('"').Trim("'").Trim()
+}
+
+Write-Host ""
+Write-Host "Default log folder:" -ForegroundColor Gray
+Write-Host "  $DefaultLogFolder" -ForegroundColor DarkGray
+$InputLogFolder = Read-Host "Enter log output folder (or press Enter to use default)"
+if ([string]::IsNullOrWhiteSpace($InputLogFolder)) {
+    $LogFolder = $DefaultLogFolder
+} else {
+    $LogFolder = (Remove-InvisibleChars $InputLogFolder).Trim('"').Trim("'").Trim()
+}
+
+# Validate CSV exists
+if (-not (Test-Path -LiteralPath $CsvPath)) {
+    Write-Host ""
+    Write-Host "ERROR: CSV file not found at:" -ForegroundColor Red
+    Write-Host "  $CsvPath" -ForegroundColor Red
+    $codes = ([char[]]$CsvPath | Select-Object -First 5 | ForEach-Object { [int]$_ }) -join ','
+    Write-Host "  First 5 char codes: $codes  (normal 'C:\' starts with 67,58,92)" -ForegroundColor DarkGray
+    Write-Host "Please correct the path and run Phase 1 again." -ForegroundColor Yellow
+    return
+}
+
+# Create log folder if missing
+if (-not (Test-Path -LiteralPath $LogFolder)) {
+    try {
+        New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+        Write-Host "Created log folder: $LogFolder" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "ERROR: Could not create log folder '$LogFolder': $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogPath   = Join-Path -Path $LogFolder -ChildPath "CreateA3Students_$TimeStamp.csv"
+
+Write-Host ""
+Write-Host "Paths configured:" -ForegroundColor Green
+Write-Host "  CSV Input              : $CsvPath" -ForegroundColor Green
+Write-Host "  Log Output             : $LogPath" -ForegroundColor Green
+Write-Host "  Default Usage Location : $DefaultUsageLocation (fallback only - CSV's UsageLocation column takes priority)" -ForegroundColor Green
+
+
+
+# ============================================================
+# PHASE 2 - Connect to Microsoft Graph (with sign-in mode choice)
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 2: Connect to Microsoft Graph" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# Ensure required modules are available
+$RequiredModules = @('Microsoft.Graph.Users', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Users.Actions')
+foreach ($Module in $RequiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $Module)) {
+        Write-Host ""
+        Write-Host "ERROR: Required module '$Module' is not installed." -ForegroundColor Red
+        Write-Host "Install with this command, then re-run Phase 2:" -ForegroundColor Yellow
+        Write-Host "  Install-Module Microsoft.Graph -Scope CurrentUser -Force" -ForegroundColor Yellow
+        return
+    }
+    try {
+        Import-Module $Module -ErrorAction Stop
+    }
+    catch {
+        Write-Host "ERROR: Failed to import '$Module': $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+# Prompt for Tenant ID
+Write-Host ""
+$InputTenantId = Read-Host "Enter your Tenant ID (required - GUID format)"
+$TenantId = (Remove-InvisibleChars $InputTenantId).Trim()
+if ([string]::IsNullOrWhiteSpace($TenantId)) {
+    Write-Host "ERROR: Tenant ID is required." -ForegroundColor Red
+    return
+}
+
+# Sign-in mode selection
+Write-Host ""
+Write-Host "Sign-in mode:" -ForegroundColor Cyan
+Write-Host "  [1] Browser session (device code - opens in your current browser, no popup)" -ForegroundColor White
+Write-Host "  [2] Interactive popup window (default Graph SDK behavior)" -ForegroundColor White
+Write-Host "  [3] Reuse existing session if already connected to this tenant" -ForegroundColor White
+Write-Host ""
+$SignInChoice = Read-Host "Enter choice (1, 2, or 3 - press Enter for 1)"
+$SignInChoice = $SignInChoice.Trim()
+if ([string]::IsNullOrWhiteSpace($SignInChoice)) { $SignInChoice = '1' }
+
+$AlreadyConnected = $false
+if ($SignInChoice -eq '3') {
+    try {
+        $ExistingContext = Get-MgContext -ErrorAction Stop
+        if ($ExistingContext -and $ExistingContext.TenantId -eq $TenantId) {
+            $AlreadyConnected = $true
+            $Context = $ExistingContext
+            Write-Host ""
+            Write-Host "Reusing existing session." -ForegroundColor Green
+            Write-Host "  Account : $($Context.Account)" -ForegroundColor Green
+            Write-Host "  Tenant  : $($Context.TenantId)" -ForegroundColor Green
+        } else {
+            Write-Host "No matching existing session - falling back to browser sign-in." -ForegroundColor DarkYellow
+            $SignInChoice = '1'
+        }
+    }
+    catch {
+        Write-Host "No existing session - falling back to browser sign-in." -ForegroundColor DarkYellow
+        $SignInChoice = '1'
+    }
+}
+
+if (-not $AlreadyConnected) {
+    try {
+        Write-Host ""
+        Write-Host "Connecting to Microsoft Graph (Tenant: $TenantId)..." -ForegroundColor Cyan
+        if ($SignInChoice -eq '1') {
+            Write-Host "A device code will be shown below. Open the URL in your current browser and enter the code." -ForegroundColor DarkGray
+            Connect-MgGraph -TenantId $TenantId -Scopes "User.ReadWrite.All","Directory.ReadWrite.All","Organization.Read.All" -UseDeviceCode -NoWelcome -ErrorAction Stop
+        }
+        else {
+            Write-Host "An interactive popup window will appear for sign-in." -ForegroundColor DarkGray
+            Connect-MgGraph -TenantId $TenantId -Scopes "User.ReadWrite.All","Directory.ReadWrite.All","Organization.Read.All" -NoWelcome -ErrorAction Stop
+        }
+        $Context = Get-MgContext
+        Write-Host ""
+        Write-Host "Connected successfully." -ForegroundColor Green
+        Write-Host "  Account : $($Context.Account)" -ForegroundColor Green
+        Write-Host "  Tenant  : $($Context.TenantId)" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "ERROR: Failed to connect to Microsoft Graph: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+# Fetch all tenant SKUs - actual license selection happens in Phase 4
+try {
+    Write-Host ""
+    Write-Host "Fetching available licenses from tenant..." -ForegroundColor Cyan
+    $TenantSkus = Get-MgSubscribedSku -ErrorAction Stop
+    if (-not $TenantSkus -or $TenantSkus.Count -eq 0) {
+        Write-Host "ERROR: No SKUs found in tenant." -ForegroundColor Red
+        return
+    }
+    Write-Host "Found $($TenantSkus.Count) SKU(s) in tenant. You will select one in Phase 4." -ForegroundColor Green
+}
+catch {
+    Write-Host "ERROR: Could not retrieve tenant SKUs: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+
+
+# ============================================================
+# PHASE 3 - Verify CSV Contents
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 3: Verify CSV Contents" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+try {
+    $Students = Import-Csv -Path $CsvPath -ErrorAction Stop
+}
+catch {
+    Write-Host "ERROR: Failed to read CSV: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+if ($null -eq $Students -or $Students.Count -eq 0) {
+    Write-Host "ERROR: CSV file is empty: $CsvPath" -ForegroundColor Red
+    return
+}
+
+# Required CSV columns (new schema)
+$RequiredColumns = @('GivenName', 'Surname', 'DisplayName', 'UserPrincipalName', 'MailNickname', 'Password', 'UsageLocation', 'LicenseGroup')
+$OptionalColumns = @('JobTitle', 'Department')
+$ActualColumns   = $Students[0].PSObject.Properties.Name
+$MissingColumns  = $RequiredColumns | Where-Object { $_ -notin $ActualColumns }
+
+if ($MissingColumns.Count -gt 0) {
+    Write-Host "ERROR: CSV missing required column(s): $($MissingColumns -join ', ')" -ForegroundColor Red
+    Write-Host "Required : $($RequiredColumns -join ', ')" -ForegroundColor Yellow
+    Write-Host "Optional : $($OptionalColumns -join ', ')" -ForegroundColor Yellow
+    Write-Host "Found    : $($ActualColumns -join ', ')" -ForegroundColor Yellow
+    return
+}
+
+Write-Host ""
+Write-Host "CSV loaded successfully. Total rows: $($Students.Count)" -ForegroundColor Green
+Write-Host ""
+Write-Host "Preview (first 20 rows):" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+
+$RowNum = 0
+$Students | Select-Object -First 20 | ForEach-Object {
+    $RowNum++
+    [PSCustomObject]@{
+        Row           = $RowNum
+        DisplayName   = $(if ([string]::IsNullOrWhiteSpace($_.DisplayName))       { '<EMPTY>' } else { $_.DisplayName.Trim() })
+        UPN           = $(if ([string]::IsNullOrWhiteSpace($_.UserPrincipalName)) { '<EMPTY>' } else { $_.UserPrincipalName.Trim() })
+        GivenName     = $(if ([string]::IsNullOrWhiteSpace($_.GivenName))         { '<EMPTY>' } else { $_.GivenName.Trim() })
+        Surname       = $(if ([string]::IsNullOrWhiteSpace($_.Surname))           { '<EMPTY>' } else { $_.Surname.Trim() })
+        MailNickname  = $(if ([string]::IsNullOrWhiteSpace($_.MailNickname))      { '<EMPTY>' } else { $_.MailNickname.Trim() })
+        UsageLocation = $(if ([string]::IsNullOrWhiteSpace($_.UsageLocation))     { '<EMPTY>' } else { $_.UsageLocation.Trim() })
+        LicenseGroup  = $(if ([string]::IsNullOrWhiteSpace($_.LicenseGroup))     { '<EMPTY>' } else { $_.LicenseGroup.Trim() })
+        JobTitle      = $(if ($null -eq $_.JobTitle)    { '' } else { ([string]$_.JobTitle).Trim() })
+        Department    = $(if ($null -eq $_.Department)  { '' } else { ([string]$_.Department).Trim() })
+        Password      = $(if ([string]::IsNullOrWhiteSpace($_.Password))         { '<EMPTY>' } else { $_.Password.Trim() })
+    }
+} | Format-Table -AutoSize | Out-Host
+
+if ($Students.Count -gt 20) {
+    Write-Host "  ... and $($Students.Count - 20) more row(s) not shown" -ForegroundColor DarkGray
+}
+Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+
+
+
+# ============================================================
+# PHASE 4 - Confirmation
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 4: Select License + Confirmation" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# -----------------------------------------------------------
+# Normalize a raw CSV LicenseGroup value to exactly 'Faculty' or 'Student'.
+# Returns $null if blank or anything else.
+# -----------------------------------------------------------
+function Get-NormalizedLicenseGroup {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim()
+    if ($v -match '^(?i)faculty$') { return 'Faculty' }
+    if ($v -match '^(?i)student$') { return 'Student' }
+    return $null
+}
+
+# -----------------------------------------------------------
+# License picker (numbered menu from tenant SKUs) - reusable per LicenseGroup
+# -----------------------------------------------------------
+function Select-LicenseForGroup {
+    param(
+        [Parameter(Mandatory)][string]$GroupName,
+        [Parameter(Mandatory)]$SortedSkus
+    )
+    while ($true) {
+        Write-Host ""
+        Write-Host "Available licenses in this tenant - choose one for LicenseGroup '$GroupName':" -ForegroundColor Cyan
+        Write-Host ""
+        $idx = 0
+        $SkuMenu = foreach ($sku in $SortedSkus) {
+            $idx++
+            $enabled   = $sku.PrepaidUnits.Enabled
+            $consumed  = $sku.ConsumedUnits
+            $available = $enabled - $consumed
+            [PSCustomObject]@{
+                '#'           = $idx
+                SkuPartNumber = $sku.SkuPartNumber
+                Enabled       = $enabled
+                Consumed      = $consumed
+                Available     = $available
+                SkuId         = $sku.SkuId
+            }
+        }
+        $SkuMenu | Format-Table -AutoSize | Out-Host
+
+        Write-Host "  [Q] Quit / cancel entire run" -ForegroundColor White
+        Write-Host ""
+        $Choice = Read-Host "Enter the # of the license to assign to '$GroupName' users (1-$($SortedSkus.Count), or Q to cancel)"
+        $Choice = $Choice.Trim().ToUpper()
+
+        if ($Choice -eq 'Q') { return $null }
+
+        $parsed = 0
+        if (-not [int]::TryParse($Choice, [ref]$parsed)) {
+            Write-Host "ERROR: Invalid input. Enter a number from the list." -ForegroundColor Red
+            continue
+        }
+        if ($parsed -lt 1 -or $parsed -gt $SortedSkus.Count) {
+            Write-Host "ERROR: Number out of range. Pick 1-$($SortedSkus.Count)." -ForegroundColor Red
+            continue
+        }
+
+        $Selected  = $SortedSkus[$parsed - 1]
+        $enabled   = $Selected.PrepaidUnits.Enabled
+        $consumed  = $Selected.ConsumedUnits
+        $available = $enabled - $consumed
+
+        Write-Host ""
+        Write-Host "Selected for '$GroupName':" -ForegroundColor Green
+        Write-Host "  Name      : $($Selected.SkuPartNumber)" -ForegroundColor Green
+        Write-Host "  SkuId     : $($Selected.SkuId)" -ForegroundColor Green
+        Write-Host "  Enabled   : $enabled" -ForegroundColor Green
+        Write-Host "  Consumed  : $consumed" -ForegroundColor Green
+        Write-Host "  Available : $available" -ForegroundColor $(if ($available -gt 0) { 'Green' } else { 'Red' })
+
+        return @{ SkuId = $Selected.SkuId; Name = $Selected.SkuPartNumber; Available = $available }
+    }
+}
+
+# -----------------------------------------------------------
+# Determine which LicenseGroups (Faculty/Student) are actually present in the CSV
+# -----------------------------------------------------------
+$GroupCounts = @{ Faculty = 0; Student = 0 }
+$InvalidGroupRows = 0
+foreach ($s in $Students) {
+    $g = Get-NormalizedLicenseGroup -Value $s.LicenseGroup
+    if ($null -eq $g) { $InvalidGroupRows++ }
+    else { $GroupCounts[$g]++ }
+}
+
+if ($InvalidGroupRows -gt 0) {
+    Write-Host ""
+    Write-Host "WARNING: $InvalidGroupRows row(s) have a missing/invalid LicenseGroup value (must be exactly 'Faculty' or 'Student')." -ForegroundColor Yellow
+    Write-Host "         These rows will be skipped entirely during account creation." -ForegroundColor Yellow
+}
+
+$PresentGroups = @('Faculty', 'Student') | Where-Object { $GroupCounts[$_] -gt 0 }
+if ($PresentGroups.Count -eq 0) {
+    Write-Host ""
+    Write-Host "ERROR: No rows with a valid LicenseGroup ('Faculty' or 'Student') were found. Nothing to do." -ForegroundColor Red
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    return
+}
+
+Write-Host ""
+Write-Host "LicenseGroup breakdown:" -ForegroundColor Cyan
+foreach ($g in $PresentGroups) {
+    Write-Host ("  {0,-8} : {1} user(s)" -f $g, $GroupCounts[$g]) -ForegroundColor White
+}
+
+# Sort by part number for stable, predictable numbering across runs
+$SortedSkus = $TenantSkus | Sort-Object SkuPartNumber
+
+# Ask which SKU to use for each LicenseGroup actually present in the CSV
+$LicenseGroupMap = @{}
+foreach ($g in $PresentGroups) {
+    $Selection = Select-LicenseForGroup -GroupName $g -SortedSkus $SortedSkus
+    if ($null -eq $Selection) {
+        Write-Host "Cancelled by user. Disconnecting..." -ForegroundColor Red
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+        return
+    }
+    $LicenseGroupMap[$g] = $Selection
+}
+
+# Capacity check per group
+Write-Host ""
+Write-Host "License capacity check (per group):" -ForegroundColor Cyan
+$CapacityShortfall = $false
+foreach ($g in $PresentGroups) {
+    $needed = $GroupCounts[$g]
+    $avail  = $LicenseGroupMap[$g].Available
+    $ok     = $avail -ge $needed
+    Write-Host ("  {0,-8} : need {1}, available {2} ({3})" -f $g, $needed, $avail, $(if ($ok) { 'OK' } else { 'SHORT' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
+    if (-not $ok) { $CapacityShortfall = $true }
+}
+if ($CapacityShortfall) {
+    Write-Host "  Note: existing users do NOT consume new licenses, so actual shortfall may be smaller." -ForegroundColor Yellow
+    Write-Host ""
+    $ProceedShort = Read-Host "One or more groups may be short on licenses. Continue anyway? (Y/N)"
+    if ($ProceedShort -notmatch '^(y|yes)$') {
+        Write-Host "Cancelled. Disconnecting..." -ForegroundColor Red
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+        return
+    }
+}
+
+# -----------------------------------------------------------
+# Existing-user update behavior
+# -----------------------------------------------------------
+Write-Host ""
+$UpdateChoice = Read-Host "For rows where the user already exists, update their DisplayName if it differs from the CSV? (Y/N - default N)"
+$UpdateExistingDisplayName = ($UpdateChoice.Trim() -match '^(y|yes)$')
+if ($UpdateExistingDisplayName) {
+    Write-Host "  -> Existing users: DisplayName will be updated when it differs from the CSV. No other fields are touched." -ForegroundColor Green
+} else {
+    Write-Host "  -> Existing users: will be skipped entirely (no changes)." -ForegroundColor DarkGray
+}
+
+# -----------------------------------------------------------
+# Final confirmation
+# -----------------------------------------------------------
+Write-Host ""
+Write-Host "You are about to CREATE $($Students.Count) new student account(s) in tenant:" -ForegroundColor Yellow
+Write-Host "  $($Context.TenantId)" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "Each new account will be:" -ForegroundColor Yellow
+Write-Host "  - Created with AccountEnabled = true" -ForegroundColor Yellow
+Write-Host "  - UsageLocation set per-row from the CSV (falls back to '$DefaultUsageLocation' if blank)" -ForegroundColor Yellow
+Write-Host "  - Required to change password at next sign-in" -ForegroundColor Yellow
+Write-Host "  - License assigned by LicenseGroup:" -ForegroundColor Yellow
+foreach ($g in $PresentGroups) {
+    Write-Host ("      $g -> $($LicenseGroupMap[$g].Name)") -ForegroundColor Yellow
+}
+if ($InvalidGroupRows -gt 0) {
+    Write-Host "  - $InvalidGroupRows row(s) with missing/invalid LicenseGroup will be skipped" -ForegroundColor Yellow
+}
+Write-Host "  - Existing users   : $(if ($UpdateExistingDisplayName) { 'DisplayName updated if different, nothing else changed' } else { 'skipped entirely, no changes' })" -ForegroundColor Yellow
+Write-Host ""
+
+$Confirm = Read-Host "Is the CSV data correct and do you want to proceed? (Y/N)"
+
+if ($Confirm -notmatch '^(y|yes)$') {
+    Write-Host ""
+    Write-Host "Operation cancelled by user. No changes were made." -ForegroundColor Red
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    return
+}
+
+Write-Host ""
+Write-Host "Confirmed. Proceeding with account creation..." -ForegroundColor Green
+
+
+
+# ============================================================
+# PHASE 5 - Create Accounts, Assign License, Export Log
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 5: Create Accounts + Assign License" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$Log = [System.Collections.Generic.List[object]]::new()
+$Counters = @{ Created = 0; Licensed = 0; Failed = 0; Skipped = 0; Existing = 0; Updated = 0 }
+
+# Helper: sanitize a UPN / email address.
+# UPNs must contain NO whitespace anywhere (Graph rejects any space, NBSP, tab, etc.).
+# Strips: invisible Unicode formatting chars, control chars, ALL whitespace (incl. middle),
+#         NBSP (U+00A0), narrow NBSP (U+202F), figure space, em/en spaces, etc.
+# Lowercases for consistency. Validates basic 'local@domain' shape.
+# Returns @{ Value; Changed; Reason; Valid; ValidationError }
+function Sanitize-Upn {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) {
+        return @{ Value=''; Changed=$false; Reason=''; Valid=$false; ValidationError='UPN is empty' }
+    }
+    $original = $Value
+
+    # 1. Strip invisible Unicode formatting (LRM/RLM/LRE/RLE/PDF/LRO/RLO/isolates/ZWSP/ZWNJ/ZWJ/BOM)
+    $cleaned = $Value -replace '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]', ''
+    # 2. Strip C0/C1 control chars
+    $cleaned = $cleaned -replace '[\u0000-\u001F\u007F-\u009F]', ''
+    # 3. Normalize Unicode (NFD) and strip combining marks: ñ -> n, é -> e, ü -> u, ç -> c, etc.
+    $cleaned = $cleaned.Normalize([System.Text.NormalizationForm]::FormD)
+    $cleaned = $cleaned -replace '\p{Mn}', ''
+    # Handle non-decomposing characters (NFD doesn't split these)
+    $cleaned = $cleaned -replace '[Øø]', 'o'
+    $cleaned = $cleaned -replace '[Łł]', 'l'
+    $cleaned = $cleaned -replace '[Đđ]', 'd'
+    $cleaned = $cleaned -replace '[Þþ]', 'th'
+    $cleaned = $cleaned -replace '[ß]', 'ss'
+    $cleaned = $cleaned -replace '[Ææ]', 'ae'
+    $cleaned = $cleaned -replace '[Œœ]', 'oe'
+    # 4. Strip ALL whitespace (regular space, tab, NBSP U+00A0, narrow NBSP U+202F,
+    #    en/em/figure/punctuation spaces U+2000-U+200A, ideographic space U+3000, etc.)
+    $cleaned = $cleaned -replace '[\s\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]', ''
+    # 5. Lowercase
+    $cleaned = $cleaned.ToLowerInvariant()
+
+    $changed = ($cleaned -ne $original)
+    $reasons = @()
+    if ($changed) {
+        # Detect what was found in the ORIGINAL
+        if ($original -match '^\s') { $reasons += 'leading whitespace' }
+        if ($original -match '\s$') { $reasons += 'trailing whitespace' }
+        # Internal whitespace (not just leading/trailing)
+        $trimmed = $original.Trim()
+        if ($trimmed -match '\s') { $reasons += 'embedded whitespace' }
+        if ($original -match '[\u00A0\u202F\u1680\u2000-\u200A\u205F\u3000]') { $reasons += 'non-breaking/special spaces' }
+        if ($original -match '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]') { $reasons += 'invisible Unicode chars' }
+        if ($original -match '[\u0000-\u001F\u007F-\u009F]') { $reasons += 'control chars' }
+        if ($original -cne $original.ToLowerInvariant() -and -not ($reasons | Where-Object { $_ -ne $null })) { $reasons += 'lowercased' }
+        elseif ($original -cne $original.ToLowerInvariant()) { $reasons += 'lowercased' }
+        if (-not $reasons) { $reasons += 'normalized' }
+    }
+    $reason = if ($changed) { "UPN sanitized ($($reasons -join ', '))" } else { '' }
+
+    # Basic validation
+    $valid = $true
+    $verr  = ''
+    if ([string]::IsNullOrWhiteSpace($cleaned)) {
+        $valid = $false; $verr = 'UPN became empty after sanitization'
+    }
+    elseif ($cleaned -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        $valid = $false; $verr = "UPN failed format check (expected 'local@domain.tld'): '$cleaned'"
+    }
+    elseif ($cleaned.Length -gt 113) {
+        # Entra UPN max length is 113 chars
+        $valid = $false; $verr = "UPN exceeds 113-char limit ($($cleaned.Length) chars): '$cleaned'"
+    }
+
+    return @{ Value=$cleaned; Changed=$changed; Reason=$reason; Valid=$valid; ValidationError=$verr }
+}
+
+# Helper: sanitize name fields (strip invisible/control chars, enforce length limits)
+function Sanitize-NameField {
+    param([string]$Value, [string]$FieldName, [int]$MaxLength = 64)
+    if ([string]::IsNullOrEmpty($Value)) { return @{ Value=''; Changed=$false; Reason='' } }
+    $original = $Value
+    $cleaned = $Value -replace '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]', ''
+    $cleaned = $cleaned -replace '[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]', ''
+    $cleaned = ($cleaned -replace '\s+', ' ').Trim()
+    $truncated = $false
+    if ($cleaned.Length -gt $MaxLength) {
+        $cleaned = $cleaned.Substring(0, $MaxLength).Trim()
+        $truncated = $true
+    }
+    $changed = ($cleaned -ne $original)
+    $reason = ''
+    if ($changed) {
+        $r = @()
+        if ($original -match '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]') { $r += 'invisible chars' }
+        if ($original -match '[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]') { $r += 'control chars' }
+        if ($truncated) { $r += "truncated to $MaxLength" }
+        if (-not $r) { $r += 'whitespace normalized' }
+        $reason = "$FieldName sanitized ($($r -join ', '))"
+    }
+    return @{ Value=$cleaned; Changed=$changed; Reason=$reason }
+}
+
+# Helper: sanitize a CSV-supplied MailNickname.
+# MailNickname rules are STRICT: no whitespace allowed (regular space, NBSP, tab, etc.),
+# 1-64 chars, ASCII letters/digits/limited punctuation only (Graph-safe set).
+function Sanitize-MailNickname {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) {
+        return @{ Value=''; Changed=$false; Reason=''; Valid=$false; ValidationError='MailNickname is empty' }
+    }
+    $original = $Value
+    $cleaned = $Value
+    # Normalize Unicode (NFD) and strip combining marks - converts accented chars to ASCII
+    # equivalents: ñ -> n, é -> e, ü -> u, ç -> c, ã -> a, etc.
+    $cleaned = $cleaned.Normalize([System.Text.NormalizationForm]::FormD)
+    $cleaned = $cleaned -replace '\p{Mn}', ''
+    # Special-case characters that don't decompose via NFD
+    $cleaned = $cleaned -replace '[Øø]', 'o'
+    $cleaned = $cleaned -replace '[Łł]', 'l'
+    $cleaned = $cleaned -replace '[Đđ]', 'd'
+    $cleaned = $cleaned -replace '[Þþ]', 'th'
+    $cleaned = $cleaned -replace '[ß]', 'ss'
+    $cleaned = $cleaned -replace '[Ææ]', 'ae'
+    $cleaned = $cleaned -replace '[Œœ]', 'oe'
+    # Strip ALL whitespace variants
+    $cleaned = $cleaned -replace '[\s\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]', ''
+    # Strip invisible Unicode formatting and control chars
+    $cleaned = $cleaned -replace '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]', ''
+    $cleaned = $cleaned -replace '[\u0000-\u001F\u007F-\u009F]', ''
+    # Drop anything that isn't ASCII alphanumeric, dot, underscore, or hyphen (Graph-safe set)
+    $cleaned = $cleaned -replace '[^A-Za-z0-9._\-]', ''
+    $truncated = $false
+    if ($cleaned.Length -gt 64) {
+        $cleaned = $cleaned.Substring(0, 64)
+        $truncated = $true
+    }
+
+    $changed = ($cleaned -ne $original)
+    $reason = ''
+    if ($changed) {
+        $r = @()
+        if ($truncated) { $r += 'truncated to 64 chars' }
+        if (-not $r) { $r += 'invalid characters removed' }
+        $reason = "MailNickname sanitized ($($r -join ', '))"
+    }
+
+    $valid = $true
+    $verr = ''
+    if ([string]::IsNullOrWhiteSpace($cleaned)) {
+        $valid = $false; $verr = "MailNickname is empty after sanitization (original: '$original')"
+    }
+
+    return @{ Value=$cleaned; Changed=$changed; Reason=$reason; Valid=$valid; ValidationError=$verr }
+}
+
+# Helper: sanitize a CSV-supplied UsageLocation (ISO 3166-1 alpha-2 code).
+# Falls back to $DefaultUsageLocation if the cell is blank. Invalid (non 2-letter) values
+# also fall back to the default, with a warning logged.
+function Sanitize-UsageLocation {
+    param([string]$Value, [string]$Default)
+    $original = $Value
+    $cleaned = if ([string]::IsNullOrWhiteSpace($Value)) { '' } else { $Value.Trim().ToUpperInvariant() }
+    $usedDefault = $false
+    $note = ''
+
+    if ([string]::IsNullOrWhiteSpace($cleaned)) {
+        $cleaned = $Default
+        $usedDefault = $true
+        $note = "UsageLocation blank - used default '$Default'"
+    }
+    elseif ($cleaned -notmatch '^[A-Z]{2}$') {
+        $note = "UsageLocation '$original' is not a valid 2-letter code - used default '$Default'"
+        $cleaned = $Default
+        $usedDefault = $true
+    }
+
+    return @{ Value=$cleaned; UsedDefault=$usedDefault; Note=$note }
+}
+
+# Helper: invoke a Graph call with retry/backoff for 429 throttling and transient 5xx errors
+function Invoke-GraphWithRetry {
+    param([Parameter(Mandatory)][scriptblock]$Action, [int]$MaxAttempts = 5, [int]$BaseDelaySeconds = 5)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try { return & $Action }
+        catch {
+            $isLast = ($attempt -eq $MaxAttempts)
+            $msg = $_.Exception.Message
+            $status = $null
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $status = [int]$_.Exception.Response.StatusCode
+            }
+            $isRetryable = ($status -eq 429) -or ($status -ge 500 -and $status -lt 600) -or ($msg -match 'throttl|TooManyRequests|timed out|timeout')
+            if (-not $isRetryable -or $isLast) { throw }
+            $delay = $BaseDelaySeconds * [math]::Pow(2, $attempt - 1)
+            if ($_.Exception.Response -and $_.Exception.Response.Headers) {
+                $retryAfter = $_.Exception.Response.Headers['Retry-After']
+                if ($retryAfter -and ($retryAfter -as [int])) { $delay = [int]$retryAfter }
+            }
+            Write-Host "    Throttled/transient (status=$status). Retrying in $delay s... ($attempt/$MaxAttempts)" -ForegroundColor DarkYellow
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+$ProgressEvery = 25
+$TotalStudents = $Students.Count
+$RowNumber = 0
+
+foreach ($Student in $Students) {
+    $RowNumber++
+
+    # Heartbeat every N rows
+    if (($RowNumber % $ProgressEvery) -eq 0) {
+        Write-Host ""
+        Write-Host "--- Progress: $RowNumber / $TotalStudents (Created=$($Counters.Created), Existing=$($Counters.Existing), Failed=$($Counters.Failed), Skipped=$($Counters.Skipped)) ---" -ForegroundColor Magenta
+        Write-Host ""
+    }
+
+    # Periodic log flush every 100 rows
+    if (($RowNumber % 100) -eq 0 -and $Log.Count -gt 0) {
+        try { $Log | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop } catch { }
+    }
+
+    # Safe trims (preliminary - UPN/MailNickname/UsageLocation get full sanitization below)
+    $DisplayName     = if ($null -ne $Student.DisplayName)       { ([string]$Student.DisplayName).Trim() }       else { "" }
+    $UpnRaw          = if ($null -ne $Student.UserPrincipalName) { [string]$Student.UserPrincipalName }          else { "" }
+    $FirstName       = if ($null -ne $Student.GivenName)         { ([string]$Student.GivenName).Trim() }         else { "" }
+    $LastName        = if ($null -ne $Student.Surname)           { ([string]$Student.Surname).Trim() }           else { "" }
+    $MailNicknameRaw = if ($null -ne $Student.MailNickname)      { [string]$Student.MailNickname }                else { "" }
+    $UsageLocRaw     = if ($null -ne $Student.UsageLocation)     { [string]$Student.UsageLocation }               else { "" }
+    $LicenseGroupRaw = if ($null -ne $Student.LicenseGroup)      { [string]$Student.LicenseGroup }                else { "" }
+    $JobTitle        = if ($null -ne $Student.JobTitle)          { ([string]$Student.JobTitle).Trim() }           else { "" }
+    $Department      = if ($null -ne $Student.Department)        { ([string]$Student.Department).Trim() }         else { "" }
+    $Password        = if ($null -ne $Student.Password)          { ([string]$Student.Password).Trim() }           else { "" }
+
+    # Deep UPN sanitization: detects hidden spaces (leading, embedded, trailing),
+    # non-breaking spaces, invisible Unicode chars, control chars, casing inconsistencies.
+    $UpnSan = Sanitize-Upn -Value $UpnRaw
+    if ($UpnSan.Changed) {
+        Write-Host "[Row $RowNumber]   $($UpnSan.Reason)" -ForegroundColor DarkYellow
+        # Show raw vs cleaned for clarity
+        $rawCodes = ([char[]]$UpnRaw | ForEach-Object { [int]$_ }) -join ','
+        Write-Host "[Row $RowNumber]     raw    : '$UpnRaw' (codes: $rawCodes)" -ForegroundColor DarkGray
+        Write-Host "[Row $RowNumber]     cleaned: '$($UpnSan.Value)'" -ForegroundColor DarkGray
+    }
+    $UPN = $UpnSan.Value
+
+    # Reject UPN that's invalid after cleanup (empty, bad format, too long)
+    if (-not $UpnSan.Valid) {
+        Write-Host "[Row $RowNumber] Skipped: $($UpnSan.ValidationError)" -ForegroundColor Red
+        $Log.Add([PSCustomObject]@{
+            Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row               = $RowNumber
+            DisplayName       = $DisplayName
+            UserPrincipalName = $UpnRaw
+            LicenseGroup      = $LicenseGroupRaw
+            TemporaryPassword = $Password
+            UserCreated       = "No"
+            LicenseAssigned   = "No"
+            Status            = "Skipped"
+            Message           = "$($UpnSan.ValidationError). $($UpnSan.Reason)"
+        })
+        $Counters.Skipped++
+        continue
+    }
+
+    # Deep MailNickname sanitization (now CSV-supplied rather than derived from UPN)
+    $MailSan = Sanitize-MailNickname -Value $MailNicknameRaw
+    if ($MailSan.Changed) {
+        $rawCodes = ([char[]]$MailNicknameRaw | ForEach-Object { [int]$_ }) -join ','
+        Write-Host "[Row $RowNumber]   $($MailSan.Reason): '$MailNicknameRaw' -> '$($MailSan.Value)' (raw codes: $rawCodes)" -ForegroundColor DarkYellow
+    }
+    $MailNickname = $MailSan.Value
+
+    if (-not $MailSan.Valid) {
+        Write-Host "[Row $RowNumber] Skipped: $($MailSan.ValidationError)" -ForegroundColor Red
+        $Log.Add([PSCustomObject]@{
+            Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row               = $RowNumber
+            DisplayName       = $DisplayName
+            UserPrincipalName = $UPN
+            LicenseGroup      = $LicenseGroupRaw
+            TemporaryPassword = $Password
+            UserCreated       = "No"
+            LicenseAssigned   = "No"
+            Status            = "Skipped"
+            Message           = $MailSan.ValidationError
+        })
+        $Counters.Skipped++
+        continue
+    }
+
+    # UsageLocation sanitization (CSV-supplied, falls back to default if blank/invalid)
+    $UsageLocSan = Sanitize-UsageLocation -Value $UsageLocRaw -Default $DefaultUsageLocation
+    if ($UsageLocSan.Note) {
+        Write-Host "[Row $RowNumber]   $($UsageLocSan.Note)" -ForegroundColor DarkYellow
+    }
+    $UsageLocation = $UsageLocSan.Value
+
+    # LicenseGroup validation - must normalize to exactly 'Faculty' or 'Student', and that
+    # group must have a SKU chosen for it in Phase 4 ($LicenseGroupMap)
+    $LicenseGroup = Get-NormalizedLicenseGroup -Value $LicenseGroupRaw
+    if ($null -eq $LicenseGroup -or -not $LicenseGroupMap.ContainsKey($LicenseGroup)) {
+        $msg = "Missing/invalid LicenseGroup value '$LicenseGroupRaw' (must be exactly 'Faculty' or 'Student')"
+        Write-Host "[Row $RowNumber] Skipped: $msg" -ForegroundColor Red
+        $Log.Add([PSCustomObject]@{
+            Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row               = $RowNumber
+            DisplayName       = $DisplayName
+            UserPrincipalName = $UPN
+            LicenseGroup      = $LicenseGroupRaw
+            TemporaryPassword = $Password
+            UserCreated       = "No"
+            LicenseAssigned   = "No"
+            Status            = "Skipped"
+            Message           = $msg
+        })
+        $Counters.Skipped++
+        continue
+    }
+    $AssignedSkuId   = $LicenseGroupMap[$LicenseGroup].SkuId
+    $AssignedSkuName = $LicenseGroupMap[$LicenseGroup].Name
+
+    # Required-field check (UPN/MailNickname already validated above)
+    $MissingRequired = @()
+    if ([string]::IsNullOrWhiteSpace($DisplayName)) { $MissingRequired += "DisplayName" }
+    if ([string]::IsNullOrWhiteSpace($FirstName))   { $MissingRequired += "GivenName" }
+    if ([string]::IsNullOrWhiteSpace($LastName))    { $MissingRequired += "Surname" }
+    if ([string]::IsNullOrWhiteSpace($Password))    { $MissingRequired += "Password" }
+
+    if ($MissingRequired.Count -gt 0) {
+        $msg = "Missing required field(s): $($MissingRequired -join ', ')"
+        Write-Host "[Row $RowNumber] Skipped: $msg" -ForegroundColor Yellow
+        $Log.Add([PSCustomObject]@{
+            Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row               = $RowNumber
+            DisplayName       = $DisplayName
+            UserPrincipalName = $UPN
+            LicenseGroup      = $LicenseGroup
+            TemporaryPassword = $Password
+            UserCreated       = "No"
+            LicenseAssigned   = "No"
+            Status            = "Skipped"
+            Message           = $msg
+        })
+        $Counters.Skipped++
+        continue
+    }
+
+    # Sanitize DisplayName early - needed both for existing-user comparison and for creation
+    $DisplaySan = Sanitize-NameField -Value $DisplayName -FieldName 'DisplayName' -MaxLength 256
+    if ($DisplaySan.Changed) {
+        Write-Host "[Row $RowNumber]   $($DisplaySan.Reason)" -ForegroundColor DarkYellow
+    }
+    $DisplayName = $DisplaySan.Value
+
+    # Check if user already exists - update DisplayName if requested and different, else skip
+    try {
+        $existing = Invoke-GraphWithRetry { Get-MgUser -UserId $UPN -Property "Id,UserPrincipalName,DisplayName" -ErrorAction Stop }
+        if ($existing) {
+            if ($UpdateExistingDisplayName -and $existing.DisplayName -ne $DisplayName) {
+                try {
+                    Invoke-GraphWithRetry { Update-MgUser -UserId $existing.Id -DisplayName $DisplayName -ErrorAction Stop }
+                    Write-Host "[Row $RowNumber] User already exists: $UPN - DisplayName updated ('$($existing.DisplayName)' -> '$DisplayName')" -ForegroundColor Green
+                    $Log.Add([PSCustomObject]@{
+                        Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                        Row               = $RowNumber
+                        DisplayName       = $DisplayName
+                        UserPrincipalName = $UPN
+                        LicenseGroup      = $LicenseGroup
+                        TemporaryPassword = ""
+                        UserCreated       = "No"
+                        LicenseAssigned   = "N/A"
+                        Status            = "Updated"
+                        Message           = "User already existed - DisplayName updated from '$($existing.DisplayName)' to '$DisplayName'"
+                    })
+                    $Counters.Updated++
+                }
+                catch {
+                    $errMsg = $_.Exception.Message
+                    if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = "$errMsg | Details: $($_.ErrorDetails.Message)" }
+                    Write-Host "[Row $RowNumber] User already exists: $UPN - FAILED to update DisplayName: $errMsg" -ForegroundColor Red
+                    $Log.Add([PSCustomObject]@{
+                        Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                        Row               = $RowNumber
+                        DisplayName       = $DisplayName
+                        UserPrincipalName = $UPN
+                        LicenseGroup      = $LicenseGroup
+                        TemporaryPassword = ""
+                        UserCreated       = "No"
+                        LicenseAssigned   = "N/A"
+                        Status            = "Failed"
+                        Message           = "User already existed - DisplayName update failed: $errMsg"
+                    })
+                    $Counters.Failed++
+                }
+            }
+            else {
+                $reason = if (-not $UpdateExistingDisplayName) { "User already exists - no changes made (DisplayName update not enabled)" }
+                          else { "User already exists - DisplayName already up to date" }
+                Write-Host "[Row $RowNumber] User already exists: $UPN (skipping - $reason)" -ForegroundColor DarkYellow
+                $Log.Add([PSCustomObject]@{
+                    Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                    Row               = $RowNumber
+                    DisplayName       = $DisplayName
+                    UserPrincipalName = $UPN
+                    LicenseGroup      = $LicenseGroup
+                    TemporaryPassword = ""
+                    UserCreated       = "No"
+                    LicenseAssigned   = "N/A"
+                    Status            = "Existing"
+                    Message           = $reason
+                })
+                $Counters.Existing++
+            }
+            continue
+        }
+    } catch {
+        # Not found = ok, proceed to create. Any other error will be caught below.
+    }
+
+    $UserCreated     = $false
+    $LicenseAssigned = $false
+    $NewUserId       = $null
+    $StepMessages    = @()
+
+    # ---- Step A: Create user ----
+    try {
+        Write-Host "[Row $RowNumber] Creating $UPN..." -ForegroundColor Cyan
+
+        # Sanitize remaining name fields before submission (DisplayName already sanitized above)
+        $GivenSan   = Sanitize-NameField -Value $FirstName   -FieldName 'GivenName'   -MaxLength 64
+        $SurnameSan = Sanitize-NameField -Value $LastName    -FieldName 'Surname'     -MaxLength 64
+        $DeptSan    = Sanitize-NameField -Value $Department  -FieldName 'Department'  -MaxLength 64
+        $JobSan     = Sanitize-NameField -Value $JobTitle    -FieldName 'JobTitle'    -MaxLength 128
+
+        foreach ($s in @($GivenSan, $SurnameSan, $DeptSan, $JobSan)) {
+            if ($s.Changed) {
+                Write-Host "[Row $RowNumber]   $($s.Reason)" -ForegroundColor DarkYellow
+                $StepMessages += $s.Reason
+            }
+        }
+        $FirstName   = $GivenSan.Value
+        $LastName    = $SurnameSan.Value
+        $Department  = $DeptSan.Value
+        $JobTitle    = $JobSan.Value
+
+        if ([string]::IsNullOrWhiteSpace($FirstName) -or [string]::IsNullOrWhiteSpace($LastName)) {
+            throw "GivenName or Surname became empty after sanitization."
+        }
+
+        $PasswordProfile = @{
+            Password                      = $Password
+            ForceChangePasswordNextSignIn = $true
+        }
+
+        $UserParams = @{
+            AccountEnabled    = $true
+            DisplayName       = $DisplayName
+            UserPrincipalName = $UPN
+            MailNickname      = $MailNickname
+            GivenName         = $FirstName
+            Surname           = $LastName
+            UsageLocation     = $UsageLocation
+            PasswordProfile   = $PasswordProfile
+        }
+        if (-not [string]::IsNullOrWhiteSpace($JobTitle))   { $UserParams['JobTitle']   = $JobTitle }
+        if (-not [string]::IsNullOrWhiteSpace($Department)) { $UserParams['Department'] = $Department }
+
+        $NewUser = Invoke-GraphWithRetry { New-MgUser @UserParams -ErrorAction Stop }
+        $NewUserId = $NewUser.Id
+        $UserCreated = $true
+        $Counters.Created++
+        $StepMessages += "User created"
+        Write-Host "[Row $RowNumber]   User created (Id: $NewUserId)" -ForegroundColor Green
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $errMsg = "$errMsg | Details: $($_.ErrorDetails.Message)"
+        }
+        # Diagnostic on property-level failures
+        if ($errMsg -match "property '(\w+)'") {
+            $badProp = $matches[1]
+            $rawValue = switch ($badProp.ToLower()) {
+                'surname'           { $Student.Surname }
+                'givenname'         { $Student.GivenName }
+                'displayname'       { $Student.DisplayName }
+                'mailnickname'      { $Student.MailNickname }
+                'userprincipalname' { $Student.UserPrincipalName }
+                'department'        { $Student.Department }
+                'jobtitle'          { $Student.JobTitle }
+                'usagelocation'     { $Student.UsageLocation }
+                'licensegroup'      { $Student.LicenseGroup }
+                default             { $null }
+            }
+            if ($null -ne $rawValue) {
+                $rawStr = [string]$rawValue
+                $codes = ([char[]]$rawStr | Select-Object -First 16 | ForEach-Object { [int]$_ }) -join ','
+                Write-Host "[Row $RowNumber]   DIAGNOSTIC '$badProp': length=$($rawStr.Length), codes=[$codes]" -ForegroundColor Yellow
+                $errMsg = "$errMsg | Field='$badProp' codes=[$codes]"
+            }
+        }
+        Write-Host "[Row $RowNumber]   FAILED to create user: $errMsg" -ForegroundColor Red
+        $Log.Add([PSCustomObject]@{
+            Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row               = $RowNumber
+            DisplayName       = $DisplayName
+            UserPrincipalName = $UPN
+            LicenseGroup      = $LicenseGroup
+            TemporaryPassword = $Password
+            UserCreated       = "No"
+            LicenseAssigned   = "No"
+            Status            = "Failed"
+            Message           = "User creation failed: $errMsg"
+        })
+        $Counters.Failed++
+        continue
+    }
+
+    # ---- Step B: Assign license for this row's LicenseGroup ----
+    try {
+        Write-Host "[Row $RowNumber] Assigning $AssignedSkuName license (LicenseGroup: $LicenseGroup)..." -ForegroundColor Cyan
+        Start-Sleep -Seconds 2  # Brief wait to avoid race conditions
+        Invoke-GraphWithRetry {
+            Set-MgUserLicense -UserId $NewUserId `
+                -AddLicenses @(@{SkuId = $AssignedSkuId}) `
+                -RemoveLicenses @() `
+                -ErrorAction Stop | Out-Null
+        }
+        $LicenseAssigned = $true
+        $Counters.Licensed++
+        $StepMessages += "$AssignedSkuName license assigned (LicenseGroup: $LicenseGroup)"
+        Write-Host "[Row $RowNumber]   License assigned" -ForegroundColor Green
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $errMsg = "$errMsg | Details: $($_.ErrorDetails.Message)"
+        }
+        Write-Host "[Row $RowNumber]   FAILED to assign license: $errMsg" -ForegroundColor Red
+        $StepMessages += "License assignment failed: $errMsg"
+    }
+
+    $RowStatus = if ($UserCreated -and $LicenseAssigned) { "Success" }
+                 elseif ($UserCreated)                    { "Partial" }
+                 else                                     { "Failed" }
+
+    $Log.Add([PSCustomObject]@{
+        Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        Row               = $RowNumber
+        DisplayName       = $DisplayName
+        UserPrincipalName = $UPN
+        LicenseGroup      = $LicenseGroup
+        AssignedLicense   = $AssignedSkuName
+        TemporaryPassword = $Password
+        UserCreated       = $(if ($UserCreated)     { "Yes" } else { "No" })
+        LicenseAssigned   = $(if ($LicenseAssigned) { "Yes" } else { "No" })
+        Status            = $RowStatus
+        Message           = ($StepMessages -join '; ')
+    })
+}
+
+# Export log to CSV
+try {
+    $Log | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    Write-Host ""
+    Write-Host "Log file saved to:" -ForegroundColor Green
+    Write-Host "  $LogPath" -ForegroundColor Green
+}
+catch {
+    Write-Host "ERROR: Failed to export log CSV: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Summary
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Summary" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host (" Total rows         : {0}" -f $Students.Count)
+Write-Host (" Users created      : {0}" -f $Counters.Created)  -ForegroundColor Green
+Write-Host (" Licenses assigned  : {0}" -f $Counters.Licensed) -ForegroundColor Green
+Write-Host (" Already-existing   : {0}" -f $Counters.Existing) -ForegroundColor DarkYellow
+Write-Host (" DisplayName updated: {0}" -f $Counters.Updated)  -ForegroundColor Green
+Write-Host (" Failed             : {0}" -f $Counters.Failed)   -ForegroundColor Red
+Write-Host (" Skipped            : {0}" -f $Counters.Skipped)  -ForegroundColor Yellow
+Write-Host (" End Time           : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# Disconnect
+try {
+    Disconnect-MgGraph -ErrorAction Stop | Out-Null
+    Write-Host "Disconnected from Microsoft Graph." -ForegroundColor DarkGray
+}
+catch {
+    Write-Host "Warning: Disconnect-MgGraph failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # EntraID PowerShell Automation
 
 Copy-paste-into-terminal PowerShell tooling for Microsoft Entra ID / Microsoft 365
@@ -57,3 +58,10 @@ file, then delete it.
   as the audit trail. Split these into a separate restricted credentials file before using
   it against a production tenant.
 - `Bulk-ExtractM365StorageReport` has a fixed `D30` reporting period.
+=======
+[Bulk User Deployments] This script uses powershell 7 for bulk deployment of users account in Microsoft's backend EntraID
+Uses csv file that contains the list of information of users per row
+Required headers are needed to match the script
+Auto sanitize the text like trailing spaces, leading spaces, special character like enye (ñ) into regular "n" character
+[Bulk Reset PowerShell] Upload list of users in csv or excel file and bulk reset using PowerShell
+>>>>>>> 23f8d2f24aa6598c56ec68bbb402d19837cbf3d2
