@@ -1,0 +1,1315 @@
+<#
+============================================================
+Bulk Swap Entra ID User Licenses - Phased Execution
+============================================================
+Description:
+- Designed for copy-paste execution into a PowerShell terminal
+- Runs in 5 distinct phases with user confirmation
+- For each user in the CSV: removes existing license(s) and assigns ONE OR MORE target licenses
+- Supports STACKED licenses (e.g. A1 for faculty + A3 for students use benefit)
+- Automatically resolves "conflicting services" by keeping the HIGHER tier and disabling
+  the lower one (e.g. keeps SharePoint Plan 2 from A3, disables Plan 1 from A1)
+- Supports DRY RUN mode to preview changes before making them
+- Handles group-assigned licenses gracefully (cannot be removed - logged as Failed)
+- Logs all results to a timestamped CSV file with before/after audit trail
+
+Expected CSV columns (case-sensitive headers):
+  UserPrincipalName    (or Username, UPN - auto-detected)
+Optional:
+  UsageLocation        (used to backfill if user doesn't have one - defaults to PH)
+
+Requirements:
+- PowerShell 7+
+- Microsoft.Graph.Users + Microsoft.Graph.Identity.DirectoryManagement + Microsoft.Graph.Users.Actions
+- Admin role: User Administrator or Global Administrator
+- Scopes: User.ReadWrite.All, Organization.Read.All
+
+How to use:
+- Copy and paste each phase one at a time into your PowerShell terminal
+- OR copy and paste the entire script at once
+- Recommended: run in DRY RUN mode first (default), review the log, then re-run in LIVE mode
+- In Phase 4 Step 2 you may enter several license numbers separated by commas to STACK them.
+  The FIRST number you enter is the base SKU; conflicts are resolved automatically by tier.
+============================================================
+#>
+
+
+# ============================================================
+# PHASE 1 - Configure Paths (Input CSV + Output Log Folder)
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 1: Configure Paths" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# Defaults (edit or override at prompt)
+$DefaultCsvPath   = "C:\Users\LITO\Downloads\SwapLicenses.csv"
+$DefaultLogFolder = "C:\Users\LITO\Downloads\Logs"
+$DefaultUsageLocation = "PH"  # Used to backfill users without UsageLocation
+
+# Helper: strip invisible Unicode formatting chars from pasted paths
+function Remove-InvisibleChars {
+    param([string]$s)
+    if ([string]::IsNullOrEmpty($s)) { return $s }
+    return ($s -replace '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]', '')
+}
+
+Write-Host ""
+Write-Host "Default CSV path:" -ForegroundColor Gray
+Write-Host "  $DefaultCsvPath" -ForegroundColor DarkGray
+$InputCsv = Read-Host "Enter CSV file path (or press Enter to use default)"
+if ([string]::IsNullOrWhiteSpace($InputCsv)) {
+    $CsvPath = $DefaultCsvPath
+} else {
+    $CsvPath = (Remove-InvisibleChars $InputCsv).Trim('"').Trim("'").Trim()
+}
+
+Write-Host ""
+Write-Host "Default log folder:" -ForegroundColor Gray
+Write-Host "  $DefaultLogFolder" -ForegroundColor DarkGray
+$InputLogFolder = Read-Host "Enter log output folder (or press Enter to use default)"
+if ([string]::IsNullOrWhiteSpace($InputLogFolder)) {
+    $LogFolder = $DefaultLogFolder
+} else {
+    $LogFolder = (Remove-InvisibleChars $InputLogFolder).Trim('"').Trim("'").Trim()
+}
+
+# Validate CSV exists
+if (-not (Test-Path -LiteralPath $CsvPath)) {
+    Write-Host ""
+    Write-Host "ERROR: CSV file not found at:" -ForegroundColor Red
+    Write-Host "  $CsvPath" -ForegroundColor Red
+    $codes = ([char[]]$CsvPath | Select-Object -First 5 | ForEach-Object { [int]$_ }) -join ','
+    Write-Host "  First 5 char codes: $codes  (normal 'C:\' starts with 67,58,92)" -ForegroundColor DarkGray
+    Write-Host "Please correct the path and run Phase 1 again." -ForegroundColor Yellow
+    return
+}
+
+# Create log folder if missing
+if (-not (Test-Path -LiteralPath $LogFolder)) {
+    try {
+        New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+        Write-Host "Created log folder: $LogFolder" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "ERROR: Could not create log folder '$LogFolder': $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+$TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogPath   = Join-Path -Path $LogFolder -ChildPath "SwapLicensesLog_$TimeStamp.csv"
+
+Write-Host ""
+Write-Host "Paths configured:" -ForegroundColor Green
+Write-Host "  CSV Input             : $CsvPath" -ForegroundColor Green
+Write-Host "  Log Output            : $LogPath" -ForegroundColor Green
+Write-Host "  Default UsageLocation : $DefaultUsageLocation" -ForegroundColor Green
+
+
+
+# ============================================================
+# PHASE 2 - Connect to Microsoft Graph
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 2: Connect to Microsoft Graph" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# Ensure required modules are available
+$RequiredModules = @('Microsoft.Graph.Users', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Users.Actions')
+foreach ($Module in $RequiredModules) {
+    if (-not (Get-Module -ListAvailable -Name $Module)) {
+        Write-Host ""
+        Write-Host "ERROR: Required module '$Module' is not installed." -ForegroundColor Red
+        Write-Host "Install with this command, then re-run Phase 2:" -ForegroundColor Yellow
+        Write-Host "  Install-Module Microsoft.Graph -Scope CurrentUser -Force" -ForegroundColor Yellow
+        return
+    }
+    try {
+        Import-Module $Module -ErrorAction Stop
+    }
+    catch {
+        Write-Host "ERROR: Failed to import '$Module': $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+# Prompt for Tenant ID
+Write-Host ""
+$InputTenantId = Read-Host "Enter your Tenant ID (required - GUID format)"
+$TenantId = (Remove-InvisibleChars $InputTenantId).Trim()
+if ([string]::IsNullOrWhiteSpace($TenantId)) {
+    Write-Host "ERROR: Tenant ID is required." -ForegroundColor Red
+    return
+}
+
+# Sign-in mode selection
+Write-Host ""
+Write-Host "Sign-in mode:" -ForegroundColor Cyan
+Write-Host "  [1] Browser session (device code - opens in your current browser, no popup)" -ForegroundColor White
+Write-Host "  [2] Interactive popup window (default Graph SDK behavior)" -ForegroundColor White
+Write-Host "  [3] Reuse existing session if already connected to this tenant" -ForegroundColor White
+Write-Host ""
+$SignInChoice = Read-Host "Enter choice (1, 2, or 3 - press Enter for 1)"
+$SignInChoice = $SignInChoice.Trim()
+if ([string]::IsNullOrWhiteSpace($SignInChoice)) { $SignInChoice = '1' }
+
+$AlreadyConnected = $false
+if ($SignInChoice -eq '3') {
+    try {
+        $ExistingContext = Get-MgContext -ErrorAction Stop
+        if ($ExistingContext -and $ExistingContext.TenantId -eq $TenantId) {
+            $AlreadyConnected = $true
+            $Context = $ExistingContext
+            Write-Host ""
+            Write-Host "Reusing existing session." -ForegroundColor Green
+            Write-Host "  Account : $($Context.Account)" -ForegroundColor Green
+            Write-Host "  Tenant  : $($Context.TenantId)" -ForegroundColor Green
+        } else {
+            Write-Host "No matching existing session - falling back to browser sign-in." -ForegroundColor DarkYellow
+            $SignInChoice = '1'
+        }
+    }
+    catch {
+        Write-Host "No existing session - falling back to browser sign-in." -ForegroundColor DarkYellow
+        $SignInChoice = '1'
+    }
+}
+
+if (-not $AlreadyConnected) {
+    try {
+        Write-Host ""
+        Write-Host "Connecting to Microsoft Graph (Tenant: $TenantId)..." -ForegroundColor Cyan
+        if ($SignInChoice -eq '1') {
+            Write-Host "A device code will be shown below. Open the URL in your current browser and enter the code." -ForegroundColor DarkGray
+            Connect-MgGraph -TenantId $TenantId -Scopes "User.ReadWrite.All","Organization.Read.All" -UseDeviceCode -NoWelcome -ErrorAction Stop
+        }
+        else {
+            Write-Host "An interactive popup window will appear for sign-in." -ForegroundColor DarkGray
+            Connect-MgGraph -TenantId $TenantId -Scopes "User.ReadWrite.All","Organization.Read.All" -NoWelcome -ErrorAction Stop
+        }
+        $Context = Get-MgContext
+        Write-Host ""
+        Write-Host "Connected successfully." -ForegroundColor Green
+        Write-Host "  Account : $($Context.Account)" -ForegroundColor Green
+        Write-Host "  Tenant  : $($Context.TenantId)" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "ERROR: Failed to connect to Microsoft Graph: $($_.Exception.Message)" -ForegroundColor Red
+        return
+    }
+}
+
+# Fetch all tenant SKUs - selection happens in Phase 4
+try {
+    Write-Host ""
+    Write-Host "Fetching available licenses from tenant..." -ForegroundColor Cyan
+    $TenantSkus = Get-MgSubscribedSku -All -ErrorAction Stop
+    if (-not $TenantSkus -or $TenantSkus.Count -eq 0) {
+        Write-Host "ERROR: No SKUs found in tenant." -ForegroundColor Red
+        return
+    }
+    # Build a fast lookup: SkuId -> SkuPartNumber (used for logging old/new licenses by name)
+    $SkuIdToPartNumber = @{}
+    $SkuIdToSku        = @{}
+    $PlanIdToName      = @{}
+    foreach ($sku in $TenantSkus) {
+        $SkuIdToPartNumber[$sku.SkuId] = $sku.SkuPartNumber
+        $SkuIdToSku[$sku.SkuId]        = $sku
+        foreach ($pl in @($sku.ServicePlans)) {
+            $PlanIdToName[[string]$pl.ServicePlanId] = [string]$pl.ServicePlanName
+        }
+    }
+    Write-Host "Found $($TenantSkus.Count) SKU(s) in tenant." -ForegroundColor Green
+}
+catch {
+    Write-Host "ERROR: Could not retrieve tenant SKUs: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+
+
+# ============================================================
+# PHASE 3 - Verify CSV Contents
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 3: Verify CSV Contents" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+try {
+    $Users = Import-Csv -Path $CsvPath -ErrorAction Stop
+}
+catch {
+    Write-Host "ERROR: Failed to read CSV: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+if ($null -eq $Users -or $Users.Count -eq 0) {
+    Write-Host "ERROR: CSV file is empty: $CsvPath" -ForegroundColor Red
+    return
+}
+
+# Auto-detect UPN column (accepts UserPrincipalName, Username, or UPN)
+$ActualColumns = $Users[0].PSObject.Properties.Name
+$UpnColumn = $null
+foreach ($candidate in @('UserPrincipalName', 'Username', 'UPN', 'upn')) {
+    if ($ActualColumns -contains $candidate) { $UpnColumn = $candidate; break }
+}
+if (-not $UpnColumn) {
+    Write-Host "ERROR: CSV must contain a 'UserPrincipalName', 'Username', or 'UPN' column." -ForegroundColor Red
+    Write-Host "Found columns: $($ActualColumns -join ', ')" -ForegroundColor Yellow
+    return
+}
+
+# Check for optional UsageLocation column
+$HasUsageLocationColumn = $ActualColumns -contains 'UsageLocation'
+
+Write-Host ""
+Write-Host "CSV loaded successfully. Total rows: $($Users.Count)" -ForegroundColor Green
+Write-Host "  UPN column           : $UpnColumn" -ForegroundColor DarkGray
+Write-Host "  UsageLocation column : $(if ($HasUsageLocationColumn) { 'present (will use per-row)' } else { 'not present (will use default: ' + $DefaultUsageLocation + ')' })" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "Preview (first 20 rows):" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+
+$RowNum = 0
+$Users | Select-Object -First 20 | ForEach-Object {
+    $RowNum++
+    [PSCustomObject]@{
+        Row = $RowNum
+        UPN = $(if ([string]::IsNullOrWhiteSpace($_.$UpnColumn)) { '<EMPTY>' } else { $_.$UpnColumn.Trim() })
+        UsageLocation = $(if ($HasUsageLocationColumn -and -not [string]::IsNullOrWhiteSpace($_.UsageLocation)) { $_.UsageLocation.Trim() } else { "(default: $DefaultUsageLocation)" })
+    }
+} | Format-Table -AutoSize | Out-Host
+
+if ($Users.Count -gt 20) {
+    Write-Host "  ... and $($Users.Count - 20) more row(s) not shown" -ForegroundColor DarkGray
+}
+Write-Host "------------------------------------------------------------" -ForegroundColor DarkGray
+
+
+
+# ============================================================
+# PHASE 4 - Configure Swap Strategy + Select Target License + Confirm
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 4: License Swap Configuration" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+# ------------------------------------------------------------
+# Conflict resolution helpers (used by Step 2 license stacking)
+# ------------------------------------------------------------
+# Microsoft refuses an assignment when a stack carries two plans from the same
+# mutually-exclusive family at DIFFERENT tiers - e.g. "SharePoint (Plan 1) for
+# Education" from A1 alongside "SharePoint (Plan 2) for Education" from A3. The two
+# have different ServicePlanIds, so comparing plan IDs alone never finds them.
+# Rank = tier. The highest rank in each family is KEPT; everything else is disabled.
+$ServicePlanFamilies = @{
+    'SHAREPOINTLITE'               = @{ Family='SHAREPOINT'; Rank=5  }
+    'SHAREPOINTDESKLESS'           = @{ Family='SHAREPOINT'; Rank=10 }
+    'SHAREPOINTSTANDARD'           = @{ Family='SHAREPOINT'; Rank=20 }
+    'SHAREPOINTSTANDARD_EDU'       = @{ Family='SHAREPOINT'; Rank=20 }
+    'SHAREPOINTENTERPRISE'         = @{ Family='SHAREPOINT'; Rank=30 }
+    'SHAREPOINTENTERPRISE_EDU'     = @{ Family='SHAREPOINT'; Rank=30 }
+    'EXCHANGE_S_DESKLESS'          = @{ Family='EXCHANGE'; Rank=10 }
+    'EXCHANGE_S_STANDARD'          = @{ Family='EXCHANGE'; Rank=20 }
+    'EXCHANGE_S_STANDARD_MIDMARKET'= @{ Family='EXCHANGE'; Rank=20 }
+    'EXCHANGE_S_ENTERPRISE'        = @{ Family='EXCHANGE'; Rank=30 }
+    'OFFICEMOBILE_SUBSCRIPTION'    = @{ Family='OFFICEAPPS'; Rank=10 }
+    'OFFICE_PROPLUS_STUDENT'       = @{ Family='OFFICEAPPS'; Rank=25 }
+    'OFFICESUBSCRIPTION'           = @{ Family='OFFICEAPPS'; Rank=30 }
+    'SHAREPOINTWAC_EDU'            = @{ Family='OFFICEWEB'; Rank=20 }
+    'SHAREPOINTWAC'                = @{ Family='OFFICEWEB'; Rank=20 }
+    'PROJECT_ESSENTIALS'           = @{ Family='PROJECT'; Rank=10 }
+    'PROJECT_O365_P1'              = @{ Family='PROJECT'; Rank=15 }
+    'PROJECT_O365_P2'              = @{ Family='PROJECT'; Rank=20 }
+    'PROJECT_O365_P3'              = @{ Family='PROJECT'; Rank=30 }
+    'PROJECT_CLIENT_SUBSCRIPTION'  = @{ Family='PROJECT'; Rank=35 }
+    'MCOIMP'                       = @{ Family='SKYPE'; Rank=10 }
+    'MCOSTANDARD'                  = @{ Family='SKYPE'; Rank=20 }
+    'TEAMS1'                       = @{ Family='TEAMS'; Rank=20 }
+    'TEAMS_EDU'                    = @{ Family='TEAMS'; Rank=20 }
+    'AAD_BASIC_EDU'                = @{ Family='AAD'; Rank=10 }
+    'AAD_BASIC'                    = @{ Family='AAD'; Rank=10 }
+    'AAD_PREMIUM'                  = @{ Family='AAD'; Rank=20 }
+    'AAD_PREMIUM_P2'               = @{ Family='AAD'; Rank=30 }
+    'RMS_S_BASIC'                  = @{ Family='RMS'; Rank=10 }
+    'RMS_S_ENTERPRISE'             = @{ Family='RMS'; Rank=20 }
+    'RMS_S_PREMIUM'                = @{ Family='RMS'; Rank=30 }
+    'STREAM_O365_E1'               = @{ Family='STREAM'; Rank=10 }
+    'STREAM_O365_E3'               = @{ Family='STREAM'; Rank=20 }
+    'STREAM_O365_E5'               = @{ Family='STREAM'; Rank=30 }
+    'FLOW_O365_P1'                 = @{ Family='FLOW'; Rank=10 }
+    'FLOW_O365_P2'                 = @{ Family='FLOW'; Rank=20 }
+    'FLOW_O365_P3'                 = @{ Family='FLOW'; Rank=30 }
+    'POWERAPPS_O365_P1'            = @{ Family='POWERAPPS'; Rank=10 }
+    'POWERAPPS_O365_P2'            = @{ Family='POWERAPPS'; Rank=20 }
+    'POWERAPPS_O365_P3'            = @{ Family='POWERAPPS'; Rank=30 }
+    'BI_AZURE_P0'                  = @{ Family='POWERBI'; Rank=10 }
+    'BI_AZURE_P1'                  = @{ Family='POWERBI'; Rank=20 }
+    'BI_AZURE_P2'                  = @{ Family='POWERBI'; Rank=30 }
+    'OFFICE_FORMS_PLAN_1'          = @{ Family='FORMS'; Rank=10 }
+    'OFFICE_FORMS_PLAN_2'          = @{ Family='FORMS'; Rank=20 }
+    'OFFICE_FORMS_PLAN_3'          = @{ Family='FORMS'; Rank=30 }
+    'BPOS_S_TODO_1'                = @{ Family='TODO'; Rank=10 }
+    'BPOS_S_TODO_2'                = @{ Family='TODO'; Rank=20 }
+    'BPOS_S_TODO_3'                = @{ Family='TODO'; Rank=30 }
+    'YAMMER_EDU'                   = @{ Family='YAMMER'; Rank=20 }
+    'YAMMER_ENTERPRISE'            = @{ Family='YAMMER'; Rank=20 }
+    'INTUNE_O365'                  = @{ Family='INTUNE'; Rank=10 }
+    'INTUNE_A'                     = @{ Family='INTUNE'; Rank=30 }
+}
+
+function Get-PlanFamilyInfo {
+    param([string]$PlanName)
+    if ([string]::IsNullOrWhiteSpace($PlanName)) { return $null }
+    $key = $PlanName.Trim().ToUpperInvariant()
+    if ($ServicePlanFamilies.ContainsKey($key)) { return $ServicePlanFamilies[$key] }
+    return $null
+}
+
+# A SKU's tier is derived from the plans it actually carries, never guessed from its
+# name - "STANDARDWOFFPACK_IW_FACULTY" (Office 365 A1 for faculty) contains no "A1".
+function Get-SkuTierRank {
+    param($Sku)
+    $max = 0
+    foreach ($pl in @($Sku.ServicePlans)) {
+        $info = Get-PlanFamilyInfo -PlanName ([string]$pl.ServicePlanName)
+        if ($info -and $info.Rank -gt $max) { $max = $info.Rank }
+    }
+    return $max
+}
+
+# Elects one winner per service-plan family across the whole stack (highest tier,
+# tie-broken by richer SKU then by stack order) and disables every other member.
+# Plans with no known family fall back to same-ServicePlanId de-duplication.
+function Resolve-StackConflicts {
+    param([object[]]$Stack)
+
+    $disabled  = @{}
+    $decisions = [System.Collections.Generic.List[object]]::new()
+    if ($null -eq $Stack) { return @{ Disabled = $disabled; Decisions = $decisions } }
+    $Stack = @($Stack)
+    foreach ($sku in $Stack) { $disabled[$sku.SkuId] = [System.Collections.Generic.List[string]]::new() }
+    if ($Stack.Count -le 1) { return @{ Disabled = $disabled; Decisions = $decisions } }
+
+    $skuWeight = @{}
+    for ($i = 0; $i -lt $Stack.Count; $i++) {
+        $skuWeight[$Stack[$i].SkuId] = [PSCustomObject]@{
+            Tier      = (Get-SkuTierRank -Sku $Stack[$i])
+            PlanCount = @($Stack[$i].ServicePlans).Count
+            Order     = $i
+        }
+    }
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($sku in $Stack) {
+        foreach ($pl in @($sku.ServicePlans)) {
+            $info = Get-PlanFamilyInfo -PlanName ([string]$pl.ServicePlanName)
+            $entries.Add([PSCustomObject]@{
+                SkuId    = $sku.SkuId
+                SkuPart  = $sku.SkuPartNumber
+                PlanId   = [string]$pl.ServicePlanId
+                PlanName = [string]$pl.ServicePlanName
+                Family   = $(if ($info) { $info.Family } else { "ID:$($pl.ServicePlanId)" })
+                Rank     = $(if ($info) { $info.Rank }   else { 0 })
+            })
+        }
+    }
+
+    foreach ($grp in ($entries | Group-Object Family)) {
+        $members = @($grp.Group)
+        if ($members.Count -le 1) { continue }
+
+        $winner = $members | Sort-Object `
+            @{Expression={$_.Rank}; Descending=$true}, `
+            @{Expression={$skuWeight[$_.SkuId].Tier}; Descending=$true}, `
+            @{Expression={$skuWeight[$_.SkuId].PlanCount}; Descending=$true}, `
+            @{Expression={$skuWeight[$_.SkuId].Order}} | Select-Object -First 1
+
+        foreach ($m in $members) {
+            if ($m.SkuId -eq $winner.SkuId -and $m.PlanId -eq $winner.PlanId) { continue }
+            if (-not $disabled[$m.SkuId].Contains($m.PlanId)) { $disabled[$m.SkuId].Add($m.PlanId) }
+            $decisions.Add([PSCustomObject]@{
+                Family       = $grp.Name
+                KeptPlan     = $winner.PlanName
+                KeptOnSku    = $winner.SkuPart
+                DisabledPlan = $m.PlanName
+                DisabledOn   = $m.SkuPart
+                CrossTier    = ($m.PlanId -ne $winner.PlanId)
+            })
+        }
+    }
+    return @{ Disabled = $disabled; Decisions = $decisions }
+}
+
+# EDU SKU family used for strategy C (remove only EDU licenses, preserve others)
+# Includes common M365/O365 education SKUs. Others in tenant fall outside this list.
+$EduSkuPartNumbers = @(
+    'STANDARDWOFFPACK_IW_STUDENT',      # A1 Students
+    'STANDARDWOFFPACK_IW_FACULTY',      # A1 Faculty
+    'STANDARDWOFFPACK_STUDENT',         # A1 Students (alt)
+    'STANDARDWOFFPACK_FACULTY',         # A1 Faculty (alt)
+    'ENTERPRISEPACKPLUS_STUUSEBNFT',    # A3 Students
+    'ENTERPRISEPACKPLUS_FACULTY',       # A3 Faculty
+    'M365EDU_A3_STUUSEBNFT',            # A3 Students (alt)
+    'M365EDU_A3_FACULTY',               # A3 Faculty (alt)
+    'M365EDU_A5_STUUSEBNFT',            # A5 Students
+    'M365EDU_A5_FACULTY',               # A5 Faculty
+    'STANDARDWOFFPACK_IW_STUDENT_A1',   # variant
+    'STANDARDWOFFPACK_IW_FACULTY_A1'    # variant
+)
+# Build EDU SkuId set from tenant SKUs whose part numbers match the EDU list
+$EduSkuIds = @()
+foreach ($sku in $TenantSkus) {
+    if ($EduSkuPartNumbers -contains $sku.SkuPartNumber) {
+        $EduSkuIds += $sku.SkuId
+    }
+}
+
+# ---- Step 1: Removal strategy ----
+Write-Host ""
+Write-Host "Step 1: Choose removal strategy (what to remove from users' current licenses)" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  [A] Remove a SPECIFIC license (pick which one - only that SKU gets removed if present)" -ForegroundColor White
+Write-Host "  [B] Remove ALL currently assigned licenses (aggressive - nukes everything, including add-ons)" -ForegroundColor White
+Write-Host "  [C] Remove all EDU licenses only (preserves Power BI Free, Flow Free, Teams add-ons, etc.)  *recommended*" -ForegroundColor White
+Write-Host ""
+$StrategyInput = Read-Host "Enter choice (A/B/C - press Enter for C)"
+$StrategyInput = $StrategyInput.Trim().ToUpper()
+if ([string]::IsNullOrWhiteSpace($StrategyInput)) { $StrategyInput = 'C' }
+
+$RemovalStrategy = $null
+$SpecificRemoveSkuId = $null
+$SpecificRemoveName  = $null
+
+switch ($StrategyInput) {
+    'A' { $RemovalStrategy = 'Specific' }
+    'B' { $RemovalStrategy = 'All' }
+    'C' { $RemovalStrategy = 'EDU' }
+    default {
+        Write-Host "ERROR: Invalid choice '$StrategyInput'." -ForegroundColor Red
+        return
+    }
+}
+
+$SortedSkus = $TenantSkus | Sort-Object SkuPartNumber
+
+# For strategy A, prompt for the specific license to remove
+if ($RemovalStrategy -eq 'Specific') {
+    $PickedRemove = $false
+    while (-not $PickedRemove) {
+        Write-Host ""
+        Write-Host "Choose the license to REMOVE:" -ForegroundColor Cyan
+        Write-Host ""
+        $idx = 0
+        $Menu = foreach ($sku in $SortedSkus) {
+            $idx++
+            [PSCustomObject]@{
+                '#'           = $idx
+                SkuPartNumber = $sku.SkuPartNumber
+                Enabled       = $sku.PrepaidUnits.Enabled
+                Consumed      = $sku.ConsumedUnits
+                SkuId         = $sku.SkuId
+            }
+        }
+        $Menu | Format-Table -AutoSize | Out-Host
+        Write-Host "  [Q] Quit / cancel" -ForegroundColor White
+        Write-Host ""
+        $choice = (Read-Host "Enter # of license to REMOVE (1-$($SortedSkus.Count), or Q)").Trim().ToUpper()
+        if ($choice -eq 'Q') {
+            Write-Host "Cancelled." -ForegroundColor Red
+            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+            return
+        }
+        $parsed = 0
+        if (-not [int]::TryParse($choice, [ref]$parsed) -or $parsed -lt 1 -or $parsed -gt $SortedSkus.Count) {
+            Write-Host "ERROR: Invalid input. Try again." -ForegroundColor Red
+            continue
+        }
+        $sel = $SortedSkus[$parsed - 1]
+        $SpecificRemoveSkuId = $sel.SkuId
+        $SpecificRemoveName  = $sel.SkuPartNumber
+        Write-Host "License to REMOVE: $SpecificRemoveName ($SpecificRemoveSkuId)" -ForegroundColor Yellow
+        $PickedRemove = $true
+    }
+}
+
+# ---- Step 2: Target license(s) - one, or several to STACK ----
+Write-Host ""
+Write-Host "Step 2: Choose the NEW target license(s) to ASSIGN" -ForegroundColor Cyan
+Write-Host ""
+
+$TargetSkus   = @()
+$TargetSkuIds = @()
+$TargetNames  = @()
+$TargetDisabledPlans = @{}
+$Resolution   = $null
+
+$PickedTarget = $false
+while (-not $PickedTarget) {
+    Write-Host "Available licenses in this tenant:" -ForegroundColor Cyan
+    Write-Host ""
+    $idx = 0
+    $Menu = foreach ($sku in $SortedSkus) {
+        $idx++
+        $available = $sku.PrepaidUnits.Enabled - $sku.ConsumedUnits
+        [PSCustomObject]@{
+            '#'           = $idx
+            SkuPartNumber = $sku.SkuPartNumber
+            Enabled       = $sku.PrepaidUnits.Enabled
+            Consumed      = $sku.ConsumedUnits
+            Available     = $available
+            SkuId         = $sku.SkuId
+        }
+    }
+    $Menu | Format-Table -AutoSize | Out-Host
+    Write-Host "  Enter ONE number for a single license." -ForegroundColor White
+    Write-Host "  Enter SEVERAL numbers separated by commas to STACK them (e.g. 2,5)." -ForegroundColor White
+    Write-Host "  The FIRST number is the base SKU; service conflicts are resolved by tier." -ForegroundColor DarkGray
+    Write-Host "  [Q] Quit / cancel" -ForegroundColor White
+    Write-Host ""
+    $choice = (Read-Host "Enter # of license(s) to ASSIGN (1-$($SortedSkus.Count), comma-separated, or Q)").Trim().ToUpper()
+    if ($choice -eq 'Q') {
+        Write-Host "Cancelled." -ForegroundColor Red
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+        return
+    }
+
+    $tokens = @($choice -split '[,;\s]+' | Where-Object { $_ -ne '' })
+    if ($tokens.Count -eq 0) {
+        Write-Host "ERROR: No selection entered. Try again." -ForegroundColor Red
+        continue
+    }
+
+    # Accumulate into explicit typed lists. Do NOT use $picked.SkuId member
+    # enumeration here: on an empty array that throws under Set-StrictMode, which
+    # may still be active in the session from a previously pasted script.
+    $picked    = [System.Collections.Generic.List[object]]::new()
+    $pickedIds = [System.Collections.Generic.List[string]]::new()
+    $badInput  = $false
+
+    foreach ($t in $tokens) {
+        $parsed = 0
+        if (-not [int]::TryParse($t, [ref]$parsed) -or $parsed -lt 1 -or $parsed -gt $SortedSkus.Count) {
+            Write-Host "ERROR: '$t' is not a valid menu number. Try again." -ForegroundColor Red
+            $badInput = $true; break
+        }
+        $sel   = $SortedSkus[$parsed - 1]
+        $selId = [string]$sel.SkuId
+        if ($pickedIds.Contains($selId)) {
+            Write-Host "NOTE: '$($sel.SkuPartNumber)' entered twice - ignoring the duplicate." -ForegroundColor DarkYellow
+            continue
+        }
+        $picked.Add($sel)
+        $pickedIds.Add($selId)
+    }
+    if ($badInput -or $picked.Count -eq 0) { continue }
+
+    # Guard: a SKU cannot be both the specific-removal target and an assign target
+    if ($RemovalStrategy -eq 'Specific' -and $pickedIds.Contains([string]$SpecificRemoveSkuId)) {
+        Write-Host "ERROR: '$SpecificRemoveName' is set to be REMOVED - it cannot also be assigned. Try again." -ForegroundColor Red
+        continue
+    }
+
+    $TargetSkus   = @($picked)
+    $TargetSkuIds = @($pickedIds)
+    $TargetNames  = @($picked | ForEach-Object { $_.SkuPartNumber })
+
+    Write-Host ""
+    if ($TargetSkus.Count -eq 1) {
+        Write-Host "Target license: $($TargetNames[0])" -ForegroundColor Green
+    } else {
+        Write-Host "Target STACK ($($TargetSkus.Count) licenses):" -ForegroundColor Green
+        for ($k = 0; $k -lt $TargetSkus.Count; $k++) {
+            $tag = if ($k -eq 0) { 'BASE   ' } else { 'STACKED' }
+            Write-Host ("  $tag $($TargetNames[$k])") -ForegroundColor Green
+        }
+    }
+    $PickedTarget = $true
+}
+
+# ---- Step 2b: Resolve service-plan conflicts across the stack (automatic) ----
+$TargetDisabledPlans = @{}
+foreach ($id in $TargetSkuIds) { $TargetDisabledPlans[$id] = @() }
+
+
+if ($TargetSkus.Count -gt 1) {
+    Write-Host ""
+    Write-Host "Resolving service-plan conflicts across the stack..." -ForegroundColor Cyan
+    $Resolution = Resolve-StackConflicts -Stack $TargetSkus
+    foreach ($id in $TargetSkuIds) { $TargetDisabledPlans[$id] = @($Resolution.Disabled[$id]) }
+
+    $crossTier = @($Resolution.Decisions | Where-Object { $_.CrossTier })
+    $dupes     = @($Resolution.Decisions | Where-Object { -not $_.CrossTier })
+
+    if ($crossTier.Count -gt 0) {
+        Write-Host ""
+        Write-Host "CONFLICTING SERVICES FOUND ($($crossTier.Count)) - keeping the higher tier:" -ForegroundColor Yellow
+        foreach ($d in $crossTier) {
+            Write-Host ("  KEEP    {0,-30} from {1}" -f $d.KeptPlan, $d.KeptOnSku)     -ForegroundColor Green
+            Write-Host ("  DISABLE {0,-30} from {1}" -f $d.DisabledPlan, $d.DisabledOn) -ForegroundColor DarkYellow
+        }
+    }
+    if ($dupes.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Duplicate services ($($dupes.Count)) present in more than one SKU - disabled on the lower SKU." -ForegroundColor DarkGray
+    }
+    if ($Resolution.Decisions.Count -eq 0) {
+        Write-Host "No conflicting or duplicate services across the stack." -ForegroundColor Green
+    }
+
+    Write-Host ""
+    Write-Host "Resulting per-SKU plan configuration:" -ForegroundColor Cyan
+    foreach ($sku in $TargetSkus) {
+        $dis   = @($TargetDisabledPlans[$sku.SkuId])
+        $total = @($sku.ServicePlans).Count
+        Write-Host ("  {0,-42} {1} of {2} services active" -f $sku.SkuPartNumber, ($total - $dis.Count), $total) -ForegroundColor White
+        if ($dis.Count -gt 0) {
+            $disNames = @($dis | ForEach-Object { if ($PlanIdToName.ContainsKey($_)) { $PlanIdToName[$_] } else { $_ } })
+            Write-Host ("      disabled: {0}" -f ($disNames -join ', ')) -ForegroundColor DarkYellow
+        }
+    }
+
+    # Let the operator veto the automatic resolution if they really want to.
+    Write-Host ""
+    $ovr = Read-Host "Apply this conflict resolution? (Y = yes / N = assign all services enabled) (Enter=Y)"
+    if ($ovr -match '^(n|no)$') {
+        foreach ($id in $TargetSkuIds) { $TargetDisabledPlans[$id] = @() }
+        Write-Host "WARNING: all services left enabled - Graph will likely reject the stack as conflicting." -ForegroundColor Red
+    }
+}
+
+# Build the AddLicenses payload once - reused for every user
+$TargetLicenseParams = @(
+    foreach ($id in $TargetSkuIds) {
+        @{ SkuId = $id; DisabledPlans = @($TargetDisabledPlans[$id]) }
+    }
+)
+
+# ---- Step 3: Run mode (Dry Run vs Live) ----
+Write-Host ""
+Write-Host "Step 3: Run mode" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  [1] DRY RUN - preview changes, no writes (recommended for first run)" -ForegroundColor White
+Write-Host "  [2] LIVE - actually make the changes" -ForegroundColor White
+Write-Host ""
+$RunModeInput = Read-Host "Enter choice (1/2 - press Enter for 1)"
+$RunModeInput = $RunModeInput.Trim()
+if ([string]::IsNullOrWhiteSpace($RunModeInput)) { $RunModeInput = '1' }
+
+$IsDryRun = $true
+switch ($RunModeInput) {
+    '1' { $IsDryRun = $true }
+    '2' { $IsDryRun = $false }
+    default {
+        Write-Host "Invalid input - defaulting to DRY RUN for safety." -ForegroundColor Yellow
+        $IsDryRun = $true
+    }
+}
+$RunMode = if ($IsDryRun) { 'DryRun' } else { 'Live' }
+
+# ---- Capacity check (every SKU in the stack needs its own free units) ----
+Write-Host ""
+Write-Host "License capacity check:" -ForegroundColor Cyan
+Write-Host "  Users in CSV        : $($Users.Count)" -ForegroundColor White
+$AnyShort = $false
+foreach ($sku in $TargetSkus) {
+    $avail = $sku.PrepaidUnits.Enabled - $sku.ConsumedUnits
+    $colour = if ($avail -ge $Users.Count) { 'Green' } else { 'Red' }
+    Write-Host ("  {0,-42} {1,6} available" -f $sku.SkuPartNumber, $avail) -ForegroundColor $colour
+    if ($avail -lt $Users.Count) {
+        $AnyShort = $true
+        Write-Host ("      short by {0} unit(s)" -f ($Users.Count - $avail)) -ForegroundColor Red
+    }
+}
+if (-not $AnyShort) {
+    Write-Host "  Result              : SUFFICIENT for every SKU in the stack" -ForegroundColor Green
+} else {
+    Write-Host "  Result              : POTENTIALLY INSUFFICIENT - see the SKUs flagged above" -ForegroundColor Red
+}
+Write-Host "  Note: a stacked assignment consumes ONE unit of EACH SKU per user." -ForegroundColor DarkGray
+Write-Host "  Note: users who already hold a target SKU won't consume new units of it." -ForegroundColor DarkGray
+
+# ---- Final confirmation ----
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Operation Summary" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host " Tenant          : $($Context.TenantId)"
+Write-Host " Users in CSV    : $($Users.Count)"
+Write-Host " Removal strategy: $RemovalStrategy $(switch ($RemovalStrategy) {
+    'Specific' { " (removes '$SpecificRemoveName' only)" }
+    'All'      { ' (removes ALL current licenses)' }
+    'EDU'      { " (removes all EDU licenses: $($EduSkuIds.Count) match(es) in this tenant)" }
+})"
+if ($TargetSkus.Count -eq 1) {
+    Write-Host " Target license  : $($TargetNames[0])"
+} else {
+    Write-Host " Target STACK    : $($TargetNames -join '  +  ')"
+    $totalDisabled = 0
+    foreach ($id in $TargetSkuIds) { $totalDisabled += @($TargetDisabledPlans[$id]).Count }
+    Write-Host " Conflict handling: $totalDisabled service plan(s) disabled to make the stack assignable"
+}
+Write-Host " Run mode        : $RunMode" -ForegroundColor $(if ($IsDryRun) { 'Yellow' } else { 'Red' })
+Write-Host " Default UsageLoc: $DefaultUsageLocation (used if user has none set)"
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+if ($IsDryRun) {
+    Write-Host "DRY RUN mode - no actual changes will be made. The log will show what WOULD change." -ForegroundColor Yellow
+} else {
+    Write-Host "*** LIVE MODE *** - actual license changes will be made to $($Users.Count) user(s)!" -ForegroundColor Red
+}
+Write-Host ""
+
+$Confirm = Read-Host "Do you want to proceed? (Y/N)"
+if ($Confirm -notmatch '^(y|yes)$') {
+    Write-Host ""
+    Write-Host "Operation cancelled by user. No changes were made." -ForegroundColor Red
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    return
+}
+
+Write-Host ""
+Write-Host "Confirmed. Proceeding with license swap..." -ForegroundColor Green
+
+
+
+# ============================================================
+# PHASE 5 - Execute License Swap + Export Log
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " PHASE 5: License Swap Execution ($RunMode)" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$Log = [System.Collections.Generic.List[object]]::new()
+$Counters = @{ Success = 0; NoChange = 0; Failed = 0; NotFound = 0; Skipped = 0; WouldChange = 0 }
+
+# Helper: sanitize UPN (strips whitespace, invisible chars, normalizes Unicode, lowercases)
+function Sanitize-Upn {
+    param([string]$Value)
+    if ([string]::IsNullOrEmpty($Value)) {
+        return @{ Value=''; Changed=$false; Reason=''; Valid=$false; ValidationError='UPN is empty' }
+    }
+    $original = $Value
+    $cleaned = $Value -replace '[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]', ''
+    $cleaned = $cleaned -replace '[\u0000-\u001F\u007F-\u009F]', ''
+    # Unicode normalization: strip diacritics (ñ -> n, é -> e, etc.)
+    $cleaned = $cleaned.Normalize([System.Text.NormalizationForm]::FormD)
+    $cleaned = $cleaned -replace '\p{Mn}', ''
+    $cleaned = $cleaned -replace '[Øø]', 'o'
+    $cleaned = $cleaned -replace '[Łł]', 'l'
+    $cleaned = $cleaned -replace '[Đđ]', 'd'
+    $cleaned = $cleaned -replace '[Þþ]', 'th'
+    $cleaned = $cleaned -replace '[ß]', 'ss'
+    $cleaned = $cleaned -replace '[Ææ]', 'ae'
+    $cleaned = $cleaned -replace '[Œœ]', 'oe'
+    $cleaned = $cleaned -replace '[\s\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]', ''
+    $cleaned = $cleaned.ToLowerInvariant()
+
+    $changed = ($cleaned -ne $original)
+    $valid = $true
+    $verr  = ''
+    if ([string]::IsNullOrWhiteSpace($cleaned)) {
+        $valid = $false; $verr = 'UPN became empty after sanitization'
+    }
+    elseif ($cleaned -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') {
+        $valid = $false; $verr = "UPN failed format check: '$cleaned'"
+    }
+    elseif ($cleaned.Length -gt 113) {
+        $valid = $false; $verr = "UPN exceeds 113-char limit ($($cleaned.Length) chars)"
+    }
+    return @{ Value=$cleaned; Changed=$changed; Valid=$valid; ValidationError=$verr }
+}
+
+# Helper: retry Graph calls on 429/5xx with backoff
+function Invoke-GraphWithRetry {
+    param([Parameter(Mandatory)][scriptblock]$Action, [int]$MaxAttempts = 5, [int]$BaseDelaySeconds = 5)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try { return & $Action }
+        catch {
+            $isLast = ($attempt -eq $MaxAttempts)
+            $msg = $_.Exception.Message
+            $status = $null
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $status = [int]$_.Exception.Response.StatusCode
+            }
+            $isRetryable = ($status -eq 429) -or ($status -ge 500 -and $status -lt 600) -or ($msg -match 'throttl|TooManyRequests|timed out|timeout')
+            if (-not $isRetryable -or $isLast) { throw }
+            $delay = $BaseDelaySeconds * [math]::Pow(2, $attempt - 1)
+            if ($_.Exception.Response -and $_.Exception.Response.Headers) {
+                $retryAfter = $_.Exception.Response.Headers['Retry-After']
+                if ($retryAfter -and ($retryAfter -as [int])) { $delay = [int]$retryAfter }
+            }
+            Write-Host "    Throttled/transient (status=$status). Retrying in $delay s... ($attempt/$MaxAttempts)" -ForegroundColor DarkYellow
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+# Helper: convert a list of SKU IDs to a semicolon-joined string of part numbers (for logging)
+function Format-SkuList {
+    param([string[]]$SkuIds)
+    if (-not $SkuIds -or $SkuIds.Count -eq 0) { return "(none)" }
+    $names = foreach ($id in $SkuIds) {
+        if ($SkuIdToPartNumber.ContainsKey($id)) { $SkuIdToPartNumber[$id] } else { $id }
+    }
+    return ($names -join '; ')
+}
+
+$ProgressEvery = 25
+$TotalUsers    = $Users.Count
+$RowNumber     = 0
+
+foreach ($u in $Users) {
+    $RowNumber++
+
+    # Heartbeat every N rows
+    if (($RowNumber % $ProgressEvery) -eq 0) {
+        Write-Host ""
+        Write-Host "--- Progress: $RowNumber / $TotalUsers (Success=$($Counters.Success), NoChange=$($Counters.NoChange), WouldChange=$($Counters.WouldChange), Failed=$($Counters.Failed), NotFound=$($Counters.NotFound), Skipped=$($Counters.Skipped)) ---" -ForegroundColor Magenta
+        Write-Host ""
+    }
+
+    # Periodic log flush every 100 rows
+    if (($RowNumber % 100) -eq 0 -and $Log.Count -gt 0) {
+        try { $Log | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop } catch { }
+    }
+
+    $UpnRaw = if ($null -ne $u.$UpnColumn) { [string]$u.$UpnColumn } else { "" }
+    $CsvUsageLocation = if ($HasUsageLocationColumn -and $null -ne $u.UsageLocation) { ([string]$u.UsageLocation).Trim() } else { "" }
+
+    # Sanitize UPN
+    $UpnSan = Sanitize-Upn -Value $UpnRaw
+    if ($UpnSan.Changed) {
+        Write-Host "[Row $RowNumber]   UPN cleaned: '$UpnRaw' -> '$($UpnSan.Value)'" -ForegroundColor DarkYellow
+    }
+    $UPN = $UpnSan.Value
+
+    if (-not $UpnSan.Valid) {
+        Write-Host "[Row $RowNumber] Skipped: $($UpnSan.ValidationError)" -ForegroundColor Red
+        $Log.Add([PSCustomObject]@{
+            Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row                   = $RowNumber
+            UserPrincipalName     = $UpnRaw
+            RunMode               = $RunMode
+            Strategy              = $RemovalStrategy
+            OldLicenses           = ""
+            NewLicenses           = ""
+            LicensesAdded         = ""
+            LicensesRemoved       = ""
+            GroupAssignedLicenses = ""
+            DisabledPlans         = ""
+            Status                = "Skipped"
+            Message               = $UpnSan.ValidationError
+        })
+        $Counters.Skipped++
+        continue
+    }
+
+    Write-Host "[Row $RowNumber] Processing $UPN..." -ForegroundColor Cyan
+
+    # Look up the user
+    $ExistingUser = $null
+    try {
+        $ExistingUser = Invoke-GraphWithRetry {
+            Get-MgUser -UserId $UPN -Property "Id,UserPrincipalName,UsageLocation" -ErrorAction Stop
+        }
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $errMsg = "$errMsg | Details: $($_.ErrorDetails.Message)"
+        }
+        $isNotFound = $errMsg -match 'Request_ResourceNotFound|Resource ''.*'' does not exist|NotFound'
+        if ($isNotFound) {
+            Write-Host "[Row $RowNumber]   User not found in Entra" -ForegroundColor DarkYellow
+            $Log.Add([PSCustomObject]@{
+                Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                Row                   = $RowNumber
+                UserPrincipalName     = $UPN
+                RunMode               = $RunMode
+                Strategy              = $RemovalStrategy
+                OldLicenses           = ""
+                NewLicenses           = ""
+                LicensesAdded         = ""
+                LicensesRemoved       = ""
+                GroupAssignedLicenses = ""
+                DisabledPlans         = ""
+                Status                = "NotFound"
+                Message               = "User not found in Entra ID"
+            })
+            $Counters.NotFound++
+        } else {
+            Write-Host "[Row $RowNumber]   FAILED lookup: $errMsg" -ForegroundColor Red
+            $Log.Add([PSCustomObject]@{
+                Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                Row                   = $RowNumber
+                UserPrincipalName     = $UPN
+                RunMode               = $RunMode
+                Strategy              = $RemovalStrategy
+                OldLicenses           = ""
+                NewLicenses           = ""
+                LicensesAdded         = ""
+                LicensesRemoved       = ""
+                GroupAssignedLicenses = ""
+                DisabledPlans         = ""
+                Status                = "Failed"
+                Message               = "Lookup failed: $errMsg"
+            })
+            $Counters.Failed++
+        }
+        continue
+    }
+
+    # Get current license details (need AssignedByGroup info)
+    $CurrentLicenseDetails = @()
+    try {
+        $CurrentLicenseDetails = @(Invoke-GraphWithRetry {
+            Get-MgUserLicenseDetail -UserId $ExistingUser.Id -ErrorAction Stop
+        })
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        Write-Host "[Row $RowNumber]   FAILED to fetch current licenses: $errMsg" -ForegroundColor Red
+        $Log.Add([PSCustomObject]@{
+            Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row                   = $RowNumber
+            UserPrincipalName     = $UPN
+            RunMode               = $RunMode
+            Strategy              = $RemovalStrategy
+            OldLicenses           = ""
+            NewLicenses           = ""
+            LicensesAdded         = ""
+            LicensesRemoved       = ""
+            GroupAssignedLicenses = ""
+            DisabledPlans         = ""
+            Status                = "Failed"
+            Message               = "License detail fetch failed: $errMsg"
+        })
+        $Counters.Failed++
+        continue
+    }
+
+    $CurrentSkuIds = @($CurrentLicenseDetails | ForEach-Object { $_.SkuId })
+
+    # Determine which of the user's licenses are group-assigned (cannot be removed via Set-MgUserLicense)
+    # A license is group-assigned if it has entries in AssignedByGroup (via Get-MgUser -Property AssignedLicenses,LicenseAssignmentStates)
+    # We need this from a different call - fetch LicenseAssignmentStates
+    $GroupAssignedSkuIds = @()
+    try {
+        $userWithStates = Invoke-GraphWithRetry {
+            Get-MgUser -UserId $ExistingUser.Id -Property "Id,LicenseAssignmentStates" -ErrorAction Stop
+        }
+        if ($userWithStates.LicenseAssignmentStates) {
+            $GroupAssignedSkuIds = @(
+                $userWithStates.LicenseAssignmentStates |
+                    Where-Object { $_.AssignedByGroup } |
+                    ForEach-Object { $_.SkuId } |
+                    Select-Object -Unique
+            )
+        }
+    }
+    catch {
+        # Non-fatal - proceed assuming direct assignment
+        $GroupAssignedSkuIds = @()
+    }
+
+    # Compute the removal set based on strategy
+    $LicensesToRemove = @()
+    switch ($RemovalStrategy) {
+        'Specific' {
+            if ($CurrentSkuIds -contains $SpecificRemoveSkuId) {
+                $LicensesToRemove = @($SpecificRemoveSkuId)
+            }
+        }
+        'All' {
+            # Remove everything the user currently has, except SKUs that are part of the target stack
+            $LicensesToRemove = @($CurrentSkuIds | Where-Object { $TargetSkuIds -notcontains $_ })
+        }
+        'EDU' {
+            # Remove any EDU-family SKU the user has, except SKUs that are part of the target stack
+            $LicensesToRemove = @($CurrentSkuIds | Where-Object { $EduSkuIds -contains $_ -and $TargetSkuIds -notcontains $_ })
+        }
+    }
+
+    # Filter out group-assigned licenses from removal list (they cannot be removed directly)
+    $BlockedByGroup = @($LicensesToRemove | Where-Object { $GroupAssignedSkuIds -contains $_ })
+    $LicensesToRemove = @($LicensesToRemove | Where-Object { $GroupAssignedSkuIds -notcontains $_ })
+
+    # Decide what to add. A target SKU needs (re)applying when the user does not hold
+    # it, OR holds it with a different set of disabled service plans - re-adding a SKU
+    # is how Graph updates its DisabledPlans.
+    $MissingTargets   = @($TargetSkuIds | Where-Object { $CurrentSkuIds -notcontains $_ })
+    $PlanMismatchSkus = [System.Collections.Generic.List[string]]::new()
+    foreach ($tid in $TargetSkuIds) {
+        if ($CurrentSkuIds -notcontains $tid) { continue }
+        $detail = $CurrentLicenseDetails | Where-Object { $_.SkuId -eq $tid } | Select-Object -First 1
+        $currentDisabled = @()
+        if ($detail) {
+            $currentDisabled = @($detail.ServicePlans |
+                Where-Object { $_.ProvisioningStatus -eq 'Disabled' } |
+                ForEach-Object { [string]$_.ServicePlanId })
+        }
+        $desiredDisabled = @($TargetDisabledPlans[$tid])
+        $diffA = @($desiredDisabled | Where-Object { $currentDisabled -notcontains $_ })
+        $diffB = @($currentDisabled | Where-Object { $desiredDisabled -notcontains $_ })
+        if ($diffA.Count -gt 0 -or $diffB.Count -gt 0) { $PlanMismatchSkus.Add([string]$tid) }
+    }
+
+    $NeedsTargetAdded = ($MissingTargets.Count -gt 0 -or $PlanMismatchSkus.Count -gt 0)
+
+    # When anything needs applying, send the WHOLE stack so every SKU lands with the
+    # correct DisabledPlans in a single atomic call.
+    $LicensesToAdd = @()
+    $AddParams     = @()
+    if ($NeedsTargetAdded) {
+        $LicensesToAdd = @($TargetSkuIds)
+        $AddParams     = $TargetLicenseParams
+    }
+
+    # Compute the projected new state (for logging)
+    $ProjectedNew = @($CurrentSkuIds | Where-Object { $LicensesToRemove -notcontains $_ })
+    if ($NeedsTargetAdded) { $ProjectedNew += $TargetSkuIds }
+    $ProjectedNew = $ProjectedNew | Select-Object -Unique
+
+    # Human-readable description of the disabled plans being applied
+    $DisabledPlanStr = ""
+    if ($NeedsTargetAdded) {
+        $parts = foreach ($tid in $TargetSkuIds) {
+            $dis = @($TargetDisabledPlans[$tid])
+            if ($dis.Count -gt 0) {
+                $nm = @($dis | ForEach-Object { if ($PlanIdToName.ContainsKey($_)) { $PlanIdToName[$_] } else { $_ } })
+                "$($SkuIdToPartNumber[$tid]): $($nm -join '|')"
+            }
+        }
+        $DisabledPlanStr = (@($parts | Where-Object { $_ }) -join ' ;; ')
+    }
+
+    $OldLicensesStr = Format-SkuList $CurrentSkuIds
+    $NewLicensesStr = Format-SkuList $ProjectedNew
+    $AddedStr       = Format-SkuList $LicensesToAdd
+    $RemovedStr     = Format-SkuList $LicensesToRemove
+    $BlockedStr     = if ($BlockedByGroup.Count -gt 0) { Format-SkuList $BlockedByGroup } else { "" }
+
+    # If there's nothing to do, log NoChange
+    if ($LicensesToAdd.Count -eq 0 -and $LicensesToRemove.Count -eq 0) {
+        $noChangeMsg = if ($BlockedByGroup.Count -gt 0) {
+            "No changes possible - target stack already assigned and other licenses are group-assigned (cannot be removed via user API)"
+        } else {
+            "User already has the target license(s) with matching service plans, and nothing to remove"
+        }
+        Write-Host "[Row $RowNumber]   $noChangeMsg" -ForegroundColor DarkGray
+        $Log.Add([PSCustomObject]@{
+            Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row                   = $RowNumber
+            UserPrincipalName     = $UPN
+            RunMode               = $RunMode
+            Strategy              = $RemovalStrategy
+            OldLicenses           = $OldLicensesStr
+            NewLicenses           = $NewLicensesStr
+            LicensesAdded         = ""
+            LicensesRemoved       = ""
+            GroupAssignedLicenses = $BlockedStr
+            DisabledPlans         = ""
+            Status                = "NoChange"
+            Message               = $noChangeMsg
+        })
+        $Counters.NoChange++
+        continue
+    }
+
+    # DRY RUN: just log what would happen and continue
+    if ($IsDryRun) {
+        $dryMsg = "Would remove [$RemovedStr] and add [$AddedStr]"
+        if ($DisabledPlanStr) { $dryMsg += " | Disabled plans: $DisabledPlanStr" }
+        if ($BlockedByGroup.Count -gt 0) {
+            $dryMsg += " | Note: $BlockedStr blocked by group assignment"
+        }
+        Write-Host "[Row $RowNumber]   [DRY RUN] $dryMsg" -ForegroundColor Yellow
+        $Log.Add([PSCustomObject]@{
+            Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row                   = $RowNumber
+            UserPrincipalName     = $UPN
+            RunMode               = $RunMode
+            Strategy              = $RemovalStrategy
+            OldLicenses           = $OldLicensesStr
+            NewLicenses           = $NewLicensesStr
+            LicensesAdded         = $AddedStr
+            LicensesRemoved       = $RemovedStr
+            GroupAssignedLicenses = $BlockedStr
+            DisabledPlans         = $DisabledPlanStr
+            Status                = "WouldChange"
+            Message               = $dryMsg
+        })
+        $Counters.WouldChange++
+        continue
+    }
+
+    # LIVE MODE: check UsageLocation and backfill if needed
+    $NeedsUsageLocation = ($NeedsTargetAdded -and [string]::IsNullOrWhiteSpace($ExistingUser.UsageLocation))
+    if ($NeedsUsageLocation) {
+        $ULocToSet = if (-not [string]::IsNullOrWhiteSpace($CsvUsageLocation)) { $CsvUsageLocation } else { $DefaultUsageLocation }
+        try {
+            Invoke-GraphWithRetry { Update-MgUser -UserId $ExistingUser.Id -UsageLocation $ULocToSet -ErrorAction Stop }
+            Write-Host "[Row $RowNumber]   UsageLocation backfilled: '$ULocToSet'" -ForegroundColor Yellow
+        }
+        catch {
+            $errMsg = $_.Exception.Message
+            Write-Host "[Row $RowNumber]   FAILED to set UsageLocation: $errMsg" -ForegroundColor Red
+            $Log.Add([PSCustomObject]@{
+                Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                Row                   = $RowNumber
+                UserPrincipalName     = $UPN
+                RunMode               = $RunMode
+                Strategy              = $RemovalStrategy
+                OldLicenses           = $OldLicensesStr
+                NewLicenses           = $OldLicensesStr
+                LicensesAdded         = ""
+                LicensesRemoved       = ""
+                GroupAssignedLicenses = $BlockedStr
+                DisabledPlans         = ""
+                Status                = "Failed"
+                Message               = "UsageLocation backfill failed: $errMsg"
+            })
+            $Counters.Failed++
+            continue
+        }
+    }
+
+    # Execute the swap (atomic add+remove in one Set-MgUserLicense call).
+    # $AddParams already carries DisabledPlans per SKU, so a stacked assignment lands
+    # with its conflicts resolved in the same request.
+    try {
+        $RemoveParams = @($LicensesToRemove)
+
+        Write-Host "[Row $RowNumber]   Swapping: remove [$RemovedStr] + add [$AddedStr]" -ForegroundColor Cyan
+        if ($DisabledPlanStr) {
+            Write-Host "[Row $RowNumber]   Disabling conflicting services -> $DisabledPlanStr" -ForegroundColor DarkYellow
+        }
+        try {
+            Invoke-GraphWithRetry {
+                Set-MgUserLicense -UserId $ExistingUser.Id `
+                    -AddLicenses $AddParams `
+                    -RemoveLicenses $RemoveParams `
+                    -ErrorAction Stop | Out-Null
+            }
+        }
+        catch {
+            # Graph can refuse a combined add+remove when the incumbent license conflicts
+            # with the incoming stack. Retry as remove-first, then add.
+            $cMsg = $_.Exception.Message
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $cMsg = "$cMsg $($_.ErrorDetails.Message)" }
+            if ($cMsg -match '(?i)conflict|mutually exclusive') {
+                Write-Host "[Row $RowNumber]   Conflict on combined call - retrying as remove-then-add..." -ForegroundColor DarkYellow
+                Invoke-GraphWithRetry {
+                    if ($RemoveParams.Count -gt 0) {
+                        Set-MgUserLicense -UserId $ExistingUser.Id -AddLicenses @() -RemoveLicenses $RemoveParams -ErrorAction Stop | Out-Null
+                    }
+                    Set-MgUserLicense -UserId $ExistingUser.Id -AddLicenses $AddParams -RemoveLicenses @() -ErrorAction Stop | Out-Null
+                }
+            } else { throw }
+        }
+        Write-Host "[Row $RowNumber]   SUCCESS" -ForegroundColor Green
+
+        $successMsg = "Removed [$RemovedStr]; added [$AddedStr]"
+        if ($BlockedByGroup.Count -gt 0) {
+            $successMsg += " | Note: $BlockedStr blocked by group assignment"
+        }
+        $Log.Add([PSCustomObject]@{
+            Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row                   = $RowNumber
+            UserPrincipalName     = $UPN
+            RunMode               = $RunMode
+            Strategy              = $RemovalStrategy
+            OldLicenses           = $OldLicensesStr
+            NewLicenses           = $NewLicensesStr
+            LicensesAdded         = $AddedStr
+            LicensesRemoved       = $RemovedStr
+            GroupAssignedLicenses = $BlockedStr
+            DisabledPlans         = $DisabledPlanStr
+            Status                = "Success"
+            Message               = $successMsg
+        })
+        $Counters.Success++
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $errMsg = "$errMsg | Details: $($_.ErrorDetails.Message)"
+        }
+        # Add specific hint for common error patterns
+        if ($errMsg -match 'mutually exclusive') {
+            $errMsg += " | HINT: Try strategy 'B' (remove ALL) or 'C' (remove EDU) to resolve service plan conflicts."
+        }
+        if ($errMsg -match 'group|assigned by group') {
+            $errMsg += " | HINT: Some licenses are assigned via group membership and cannot be removed via user API."
+        }
+        Write-Host "[Row $RowNumber]   FAILED swap: $errMsg" -ForegroundColor Red
+        $Log.Add([PSCustomObject]@{
+            Timestamp             = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            Row                   = $RowNumber
+            UserPrincipalName     = $UPN
+            RunMode               = $RunMode
+            Strategy              = $RemovalStrategy
+            OldLicenses           = $OldLicensesStr
+            NewLicenses           = $OldLicensesStr
+            LicensesAdded         = ""
+            LicensesRemoved       = ""
+            GroupAssignedLicenses = $BlockedStr
+            DisabledPlans         = $DisabledPlanStr
+            Status                = "Failed"
+            Message               = "Swap failed: $errMsg"
+        })
+        $Counters.Failed++
+    }
+}
+
+# Export log to CSV
+try {
+    $Log | Export-Csv -Path $LogPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    Write-Host ""
+    Write-Host "Log file saved to:" -ForegroundColor Green
+    Write-Host "  $LogPath" -ForegroundColor Green
+}
+catch {
+    Write-Host "ERROR: Failed to export log CSV: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Summary
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host " Summary ($RunMode)" -ForegroundColor Cyan
+Write-Host "------------------------------------------------------------" -ForegroundColor Cyan
+Write-Host (" Total rows          : {0}" -f $Users.Count)
+if ($IsDryRun) {
+    Write-Host (" Would change        : {0}" -f $Counters.WouldChange) -ForegroundColor Yellow
+} else {
+    Write-Host (" Success             : {0}" -f $Counters.Success)     -ForegroundColor Green
+}
+Write-Host (" No change needed    : {0}" -f $Counters.NoChange)   -ForegroundColor DarkGray
+Write-Host (" Failed              : {0}" -f $Counters.Failed)     -ForegroundColor Red
+Write-Host (" Not found           : {0}" -f $Counters.NotFound)   -ForegroundColor DarkYellow
+Write-Host (" Skipped             : {0}" -f $Counters.Skipped)    -ForegroundColor Yellow
+Write-Host (" End Time            : {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+Write-Host "============================================================" -ForegroundColor Cyan
+
+if ($IsDryRun -and $Counters.WouldChange -gt 0) {
+    Write-Host ""
+    Write-Host "This was a DRY RUN. To apply these changes, re-run the script and choose Run mode [2] LIVE." -ForegroundColor Yellow
+}
+
+# Disconnect
+try {
+    Disconnect-MgGraph -ErrorAction Stop | Out-Null
+    Write-Host "Disconnected from Microsoft Graph." -ForegroundColor DarkGray
+}
+catch {
+    Write-Host "Warning: Disconnect-MgGraph failed: $($_.Exception.Message)" -ForegroundColor Yellow
+}

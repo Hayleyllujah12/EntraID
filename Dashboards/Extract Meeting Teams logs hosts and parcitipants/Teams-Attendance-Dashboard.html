@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Teams Attendance Dashboard</title>
+<style>
+  :root{
+    color-scheme: light;
+    --plane:#f9f9f7; --surface:#fcfcfb; --surface-2:#ffffff;
+    --text:#0b0b0b; --text-2:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
+    --series-1:#2a78d6; --series-1-soft:#cde2fb;
+    --good:#006300;
+    --shadow:0 1px 2px rgba(11,11,11,.06),0 4px 16px rgba(11,11,11,.05);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:where(:not([data-theme="light"])){
+      color-scheme: dark;
+      --plane:#0d0d0d; --surface:#1a1a19; --surface-2:#232322;
+      --text:#fff; --text-2:#c3c2b7; --muted:#898781;
+      --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+      --series-1:#3987e5; --series-1-soft:#173a5e;
+      --good:#0ca30c;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --plane:#0d0d0d; --surface:#1a1a19; --surface-2:#232322;
+    --text:#fff; --text-2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+    --series-1:#3987e5; --series-1-soft:#173a5e;
+    --good:#0ca30c;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--plane); color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    font-size:14px; line-height:1.45;
+  }
+  .wrap{max-width:1180px; margin:0 auto; padding:20px 18px 60px}
+  header.top{display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-bottom:6px}
+  header.top h1{font-size:20px; margin:0; font-weight:650; letter-spacing:-.01em}
+  .sub{color:var(--text-2); font-size:12.5px; margin:2px 0 18px}
+  .spacer{flex:1}
+  button, .btn{
+    font:inherit; cursor:pointer; border:1px solid var(--border);
+    background:var(--surface-2); color:var(--text); border-radius:8px;
+    padding:7px 12px; transition:.15s;
+  }
+  button:hover,.btn:hover{border-color:var(--muted)}
+  button:disabled{opacity:.5; cursor:not-allowed}
+  .pill{font-size:12px; color:var(--text-2)}
+  /* upload */
+  #drop{
+    border:1.5px dashed var(--axis); border-radius:14px; background:var(--surface);
+    padding:34px 20px; text-align:center; transition:.15s; margin-bottom:8px;
+  }
+  #drop.drag{border-color:var(--series-1); background:var(--series-1-soft)}
+  #drop h2{margin:.2em 0 .3em; font-size:16px}
+  #drop p{color:var(--text-2); margin:.2em 0}
+  .privacy{color:var(--good); font-weight:600}
+  .hidden{display:none !important}
+  /* KPIs */
+  .kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:18px 0}
+  .kpi{background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px; box-shadow:var(--shadow)}
+  .kpi .v{font-size:26px; font-weight:680; letter-spacing:-.02em; line-height:1.1}
+  .kpi .l{color:var(--text-2); font-size:12px; margin-top:4px}
+  /* cards */
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:6px 0 18px}
+  @media (max-width:820px){ .grid2{grid-template-columns:1fr} }
+  .card{background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px; box-shadow:var(--shadow)}
+  .card h3{margin:0 0 10px; font-size:13.5px; font-weight:620; color:var(--text)}
+  .card .cap{color:var(--muted); font-size:11.5px; margin:-6px 0 10px}
+  svg{display:block; width:100%; height:auto; overflow:visible}
+  .bar{fill:var(--series-1)}
+  .barbg{fill:var(--grid); opacity:.5}
+  .axislbl{fill:var(--muted); font-size:11px}
+  .vallbl{fill:var(--text-2); font-size:11px; font-variant-numeric:tabular-nums}
+  .gridline{stroke:var(--grid); stroke-width:1}
+  /* filters */
+  .filters{display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin:4px 0 12px}
+  .filters label{display:flex; flex-direction:column; font-size:11.5px; color:var(--text-2); gap:3px}
+  .filters input, .filters select{
+    font:inherit; padding:6px 9px; border:1px solid var(--border); border-radius:8px;
+    background:var(--surface-2); color:var(--text); min-width:150px;
+  }
+  .filters input[type=date]{min-width:135px}
+  /* table */
+  .tablewrap{background:var(--surface); border:1px solid var(--border); border-radius:12px; box-shadow:var(--shadow); overflow:hidden}
+  table{border-collapse:collapse; width:100%}
+  th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--grid); vertical-align:top}
+  thead th{position:sticky; top:0; background:var(--surface-2); font-size:11.5px; text-transform:uppercase; letter-spacing:.03em; color:var(--text-2); cursor:pointer; user-select:none; white-space:nowrap}
+  thead th .arrow{color:var(--series-1); font-size:10px}
+  tbody tr.meeting{cursor:pointer}
+  tbody tr.meeting:hover{background:var(--series-1-soft)}
+  td.num{font-variant-numeric:tabular-nums; white-space:nowrap}
+  .chev{display:inline-block; width:12px; color:var(--muted); transition:transform .12s}
+  tr.open .chev{transform:rotate(90deg); color:var(--series-1)}
+  .topic{font-weight:560}
+  .detail td{background:var(--plane); padding:0}
+  .ptable{width:100%; border-collapse:collapse; margin:0}
+  .ptable th,.ptable td{padding:6px 12px; border-bottom:1px solid var(--grid); font-size:12.5px}
+  .ptable th{background:transparent; text-transform:none; letter-spacing:0; position:static; cursor:default}
+  .ptable tr:last-child td{border-bottom:none}
+  .empty{padding:26px; text-align:center; color:var(--text-2)}
+  .count{color:var(--text-2); font-size:12px; margin:8px 2px}
+  .role{display:inline-block; font-size:11px; padding:1px 7px; border-radius:20px; background:var(--series-1-soft); color:var(--text-2)}
+  .warnbar{background:#fff6e6; color:#7a5200; border:1px solid #f0d9a0; padding:8px 12px; border-radius:8px; font-size:12.5px; margin-bottom:12px}
+  :root[data-theme="dark"] .warnbar, :root:where(:not([data-theme="light"])) .warnbar{background:#2a2410; color:#e8c976; border-color:#5a4a1e}
+  /* ===== report branding options panel (screen) ===== */
+  .printonly{display:none}
+  #optsPanel{ display:none; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:14px 16px; margin:2px 0 12px; box-shadow:var(--shadow) }
+  #optsPanel.show{ display:block }
+  #optsPanel h3{ margin:0 0 10px; font-size:13.5px }
+  .optgrid{ display:grid; grid-template-columns:1fr 1fr; gap:12px 18px }
+  @media(max-width:820px){ .optgrid{ grid-template-columns:1fr } }
+  .optrow{ display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--text-2) }
+  .optrow input[type=text], .optrow select{ padding:6px 9px; border:1px solid var(--border); border-radius:8px; background:var(--surface-2); color:var(--text); font:inherit }
+  .rowline{ display:flex; align-items:center; gap:8px; flex-wrap:wrap }
+  .logoprev{ height:34px; max-width:150px; object-fit:contain; border:1px solid var(--border); border-radius:6px; padding:2px; background:#fff }
+  .opthint{ font-size:11px; color:var(--muted); margin:8px 0 0 }
+  /* ===== report (print output) ===== */
+  #printArea{ display:none }
+  .rpt-footer{ display:none }
+  .rpt-header{ display:flex; align-items:flex-start; gap:16px; border-bottom:2px solid #333; padding-bottom:8px; margin-bottom:10px }
+  .rpt-header.vmid{ align-items:center }
+  .rpt-logo{ object-fit:contain; max-width:40% }
+  .rpt-titles{ flex:1; text-align:center }
+  .rpt-title{ font-size:18px; font-weight:700; color:#000 }
+  .rpt-sub{ font-size:13px; color:#333 }
+  .rpt-meta{ font-size:10.5px; color:#555; margin-top:3px }
+  .rpt-kpis{ font-size:11px; color:#333; margin:0 0 12px }
+  table.mtg{ width:100%; border-collapse:collapse; margin:0 0 14px; break-inside:auto }
+  table.mtg thead{ display:table-header-group }   /* meeting header + column headers repeat if it spans pages */
+  table.mtg tbody tr{ break-inside:avoid }         /* never split a single participant row */
+  .mtg .msum th{ background:#eef2f7; border:1px solid #c9d3df; padding:6px 8px; text-align:left; -webkit-print-color-adjust:exact; print-color-adjust:exact }
+  .mtg .msum .l{ font-weight:700; font-size:12.5px; color:#000 }
+  .mtg .msum .r{ float:right; font-weight:400; font-size:11px; color:#333 }
+  .mtg .phead th{ background:#f3f3f3; border:1px solid #ddd; padding:4px 8px; font-size:10px; text-transform:uppercase; letter-spacing:.03em; color:#333; text-align:left; -webkit-print-color-adjust:exact; print-color-adjust:exact }
+  .mtg tbody td{ border:1px solid #e2e2e2; padding:3px 8px; font-size:11px; color:#000 }
+  .mtg .n{ text-align:right; white-space:nowrap }
+  @media print{
+    @page{ margin:14mm 12mm 14mm 12mm }
+    html,body{ background:#fff !important; color:#000 !important }
+    .wrap{ max-width:none; padding:0 }
+    header.top, .sub, #drop, .grid2, .filters, #count, #warn, .kpis, .tablewrap, #optsPanel{ display:none !important }
+    #printArea{ display:block !important }
+    /* footer flows after the tables (not fixed) so it can never overlap content */
+    .rpt-footer{ display:flex !important; justify-content:space-between; gap:12px; margin-top:12px; padding-top:6px; border-top:1px solid #ccc; font-size:9.5px; color:#666; break-inside:avoid }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>Teams Attendance Dashboard</h1>
+    <span class="spacer"></span>
+    <span class="pill" id="fileinfo"></span>
+    <button id="themeBtn" title="Toggle light / dark">◐ Theme</button>
+    <button id="reloadBtn" class="hidden">↺ Load another file</button>
+  </header>
+  <div class="sub">Summarizes <code>TeamsAttendance_*.csv</code> (also reads the Wide CSV). Runs entirely in your browser.</div>
+
+  <!-- upload -->
+  <section id="drop">
+    <h2>Drop your CSV here, or choose a file</h2>
+    <p><input type="file" id="file" accept=".csv,text/csv"></p>
+    <p class="privacy">100% offline — your file never leaves this browser.</p>
+    <p style="font-size:12px;color:var(--muted)">Expected columns: Organizer, Subject, MeetingStartPHT, MeetingEndPHT, ParticipantName, ParticipantEmail, Role, FirstJoinPHT, LastLeavePHT, AttendanceMin, OnlineMeetingId</p>
+  </section>
+
+  <div id="dash" class="hidden">
+    <div id="warn" class="warnbar hidden"></div>
+    <div class="kpis" id="kpis"></div>
+
+    <div class="grid2">
+      <div class="card">
+        <h3>Meetings per host</h3>
+        <div class="cap" id="hostsCap"></div>
+        <div id="hostsChart"></div>
+      </div>
+      <div class="card">
+        <h3>Meetings over time</h3>
+        <div class="cap" id="timeCap"></div>
+        <div id="timeChart"></div>
+      </div>
+    </div>
+
+    <div class="filters">
+      <label>Search
+        <input type="text" id="q" placeholder="host, topic, or participant…">
+      </label>
+      <label>Host
+        <select id="hostSel"><option value="">All hosts</option></select>
+      </label>
+      <label>From
+        <input type="date" id="from">
+      </label>
+      <label>To
+        <input type="date" id="to">
+      </label>
+      <button id="clearBtn">Clear</button>
+      <button id="expandBtn">⊕ Expand all</button>
+      <span class="spacer"></span>
+      <button id="optsBtn">⚙ Report branding</button>
+      <button id="exportBtn">⭳ Export CSV</button>
+      <button id="docxBtn">⬇ Export Word</button>
+      <button id="printBtn">🖨 Print report</button>
+    </div>
+
+    <div id="optsPanel">
+      <h3>Report branding — shows on the printed report (saved on this computer)</h3>
+      <div class="optgrid">
+        <label class="optrow">Header title
+          <input type="text" id="optTitle" placeholder="e.g. Adamson University — Senior High School">
+        </label>
+        <label class="optrow">Subtitle
+          <input type="text" id="optSub" placeholder="e.g. Teams Meeting Attendance Report">
+        </label>
+        <label class="optrow">Left logo
+          <div class="rowline"><input type="file" id="optLeft" accept="image/*"><img class="logoprev hidden" id="prevLeft" alt=""><button id="clrLeft" class="hidden" title="Remove left logo">✕</button></div>
+        </label>
+        <label class="optrow">Right logo
+          <div class="rowline"><input type="file" id="optRight" accept="image/*"><img class="logoprev hidden" id="prevRight" alt=""><button id="clrRight" class="hidden" title="Remove right logo">✕</button></div>
+        </label>
+        <label class="optrow">Logo size
+          <div class="rowline"><input type="range" id="optSize" min="24" max="120" step="2"><span id="sizeVal" class="opthint"></span></div>
+        </label>
+        <label class="optrow">Logo vertical align
+          <select id="optValign"><option value="top">Top</option><option value="middle">Middle</option></select>
+        </label>
+        <label class="optrow" style="grid-column:1/-1">Footer text
+          <input type="text" id="optFooter" placeholder="e.g. Prepared by IT — Confidential">
+        </label>
+      </div>
+      <p class="opthint">Logos are embedded into the report so it stays offline. Tip: turn on “Headers and footers” in the browser print dialog to add page numbers.</p>
+    </div>
+    <div class="count" id="count"></div>
+
+    <div class="tablewrap">
+      <table id="tbl">
+        <thead><tr>
+          <th data-k="host">Host <span class="arrow"></span></th>
+          <th data-k="subject">Topic <span class="arrow"></span></th>
+          <th data-k="date">Date <span class="arrow"></span></th>
+          <th data-k="time">Start <span class="arrow"></span></th>
+          <th data-k="dur">Duration <span class="arrow"></span></th>
+          <th data-k="pcount">Participants <span class="arrow"></span></th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div id="tblEmpty" class="empty hidden">No meetings match your filters.</div>
+    </div>
+
+    <!-- print-only report (built on Print) -->
+    <div id="printArea"></div>
+    <div id="rptFooter" class="rpt-footer"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ---------- CSV parser (RFC-4180-ish: quotes, escaped quotes, embedded commas/newlines) ---------- */
+function parseCSV(text){
+  text = text.replace(/^﻿/,'');
+  const rows=[]; let cur=[], field='', inQ=false, i=0;
+  while(i<text.length){
+    const c=text[i];
+    if(inQ){
+      if(c==='"'){ if(text[i+1]==='"'){ field+='"'; i+=2; continue; } inQ=false; i++; continue; }
+      field+=c; i++; continue;
+    }
+    if(c==='"'){ inQ=true; i++; continue; }
+    if(c===','){ cur.push(field); field=''; i++; continue; }
+    if(c==='\r'){ i++; continue; }
+    if(c==='\n'){ cur.push(field); rows.push(cur); cur=[]; field=''; i++; continue; }
+    field+=c; i++;
+  }
+  if(field.length || cur.length){ cur.push(field); rows.push(cur); }
+  // to objects
+  if(!rows.length) return {headers:[],data:[]};
+  const headers = rows[0].map(h=>h.trim());
+  const data=[];
+  for(let r=1;r<rows.length;r++){
+    const row=rows[r];
+    if(row.length===1 && row[0].trim()==='') continue; // blank line
+    const o={};
+    headers.forEach((h,j)=> o[h] = (row[j]!==undefined? row[j] : ''));
+    data.push(o);
+  }
+  return {headers,data};
+}
+
+/* ---------- helpers ---------- */
+const $ = s=>document.querySelector(s);
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function toDate(s){ if(!s) return null; const d=new Date(String(s).trim().replace(' ','T')); return isNaN(d)?null:d; }
+function datePart(s){ return s? String(s).trim().split(' ')[0] : ''; }
+function timePart(s){ const p=s? String(s).trim().split(' ') : []; return p[1]? p[1].slice(0,5):''; }
+function fmtDur(mins){
+  if(mins==null || isNaN(mins) || mins<0) return '';
+  mins=Math.round(mins);
+  const h=Math.floor(mins/60), m=mins%60;
+  return h? (h+'h '+String(m).padStart(2,'0')+'m') : (m+'m');
+}
+function num(v){ const n=parseFloat(v); return isNaN(n)?0:n; }
+
+/* ---------- schema + grouping ---------- */
+function detectType(headers){
+  const H=headers.map(h=>h.toLowerCase());
+  if(H.includes('participantemail')||H.includes('participantname')) return 'attendance';
+  if(H.some(h=>h.startsWith('participant '))||H.includes('host upn')) return 'wide';
+  return 'attendance';
+}
+function buildMeetings(parsed){
+  const type=detectType(parsed.headers);
+  return type==='wide'? buildWide(parsed) : buildAttendance(parsed);
+}
+function buildAttendance(parsed){
+  const map=new Map();
+  for(const o of parsed.data){
+    const host=(o.Organizer||'').trim();
+    const subj=(o.Subject||'').trim();
+    const start=(o.MeetingStartPHT||'').trim();
+    const end=(o.MeetingEndPHT||'').trim();
+    const key=(o.OnlineMeetingId||'').trim() || (host+'|'+subj+'|'+start);
+    if(!map.has(key)) map.set(key,{host,subject:subj,start,end,parts:new Map()});
+    const m=map.get(key);
+    if(!m.host&&host)m.host=host; if(!m.subject&&subj)m.subject=subj;
+    if(!m.start&&start)m.start=start; if(!m.end&&end)m.end=end;
+    const email=(o.ParticipantEmail||'').trim();
+    const name=(o.ParticipantName||'').trim();
+    const pkey=(email||name).toLowerCase();
+    if(!pkey) continue;
+    if(!m.parts.has(pkey)){
+      m.parts.set(pkey,{name:name||email, email, role:(o.Role||'').trim(),
+        join:(o.FirstJoinPHT||'').trim(), leave:(o.LastLeavePHT||'').trim(), min:num(o.AttendanceMin)});
+    }else{
+      const p=m.parts.get(pkey);
+      if(!p.name&&name)p.name=name; if(!p.email&&email)p.email=email;
+      p.min=Math.max(p.min,num(o.AttendanceMin));
+    }
+  }
+  return finalize([...map.values()], true);
+}
+function buildWide(parsed){
+  const meetings=[];
+  const pcols=parsed.headers.filter(h=>/^participant\s*\d+$/i.test(h));
+  for(const o of parsed.data){
+    const host=(o['Host UPN']||o.Organizer||'').trim();
+    const parts=new Map();
+    for(const c of pcols){
+      const v=(o[c]||'').trim(); if(!v) continue;
+      parts.set(v.toLowerCase(),{name:v,email:v,role:'',join:'',leave:'',min:NaN});
+    }
+    meetings.push({host, subject:(o.Subject||'').trim(),
+      start:(o['Start (PHT)']||o.StartTimePHT||'').trim(),
+      end:(o['End (PHT)']||o.EndTimePHT||'').trim(),
+      _disp:(o['Display Name']||'').trim(), parts});
+  }
+  return finalize(meetings, false);
+}
+function finalize(list, hasMin){
+  const out=[];
+  for(const m of list){
+    const sd=toDate(m.start), ed=toDate(m.end);
+    const dur = (sd&&ed)? (ed-sd)/60000 : NaN;
+    const parts=[...m.parts.values()];
+    out.push({
+      host:m.host||'(unknown)', subject:m.subject||'(no title)',
+      start:m.start, end:m.end, date:datePart(m.start), time:timePart(m.start),
+      dur, durTxt:fmtDur(dur), pcount:parts.length, parts, hasMin
+    });
+  }
+  out.sort((a,b)=> (a.start<b.start?1:a.start>b.start?-1:0)); // newest first
+  return out;
+}
+
+/* ---------- state ---------- */
+let MEETINGS=[], HAS_MIN=true, sortKey='date', sortDir=-1, expandAll=false, FILE_NAME='';
+
+/* ---------- KPIs ---------- */
+function renderKPIs(ms){
+  const hosts=new Set(ms.map(m=>m.host));
+  const emails=new Set(); let totMin=0, anyMin=false;
+  ms.forEach(m=>m.parts.forEach(p=>{ emails.add((p.email||p.name).toLowerCase()); if(!isNaN(p.min)){totMin+=p.min; anyMin=true;} }));
+  const dates=ms.map(m=>m.date).filter(Boolean).sort();
+  const range = dates.length? (dates[0]===dates[dates.length-1]? dates[0] : dates[0]+' → '+dates[dates.length-1]) : '—';
+  const tiles=[
+    ['Meetings', ms.length],
+    ['Hosts', hosts.size],
+    ['Unique participants', emails.size],
+    [anyMin?'Participant-hours':'Total attendee slots', anyMin? (totMin/60).toFixed(1) : totalSlots(ms)],
+    ['Date range', range]
+  ];
+  $('#kpis').innerHTML = tiles.map(t=>`<div class="kpi"><div class="v">${esc(t[1])}</div><div class="l">${esc(t[0])}</div></div>`).join('');
+}
+function totalSlots(ms){ return ms.reduce((a,m)=>a+m.pcount,0); }
+
+/* ---------- charts (inline SVG, single series = validated blue) ---------- */
+function hbar(el, data, cap){
+  cap.textContent = data.length? '' : 'No data';
+  if(!data.length){ el.innerHTML=''; return; }
+  const rowH=26, gap=8, padL=Math.min(230, 8+Math.max(...data.map(d=>d.label.length))*6.4), padR=44, top=6;
+  const W=560, H=top*2 + data.length*(rowH+gap);
+  const max=Math.max(1,...data.map(d=>d.value));
+  const bw=W-padL-padR;
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Meetings per host">`;
+  data.forEach((d,i)=>{
+    const y=top+i*(rowH+gap);
+    const w=Math.max(3, bw*d.value/max);
+    const label=d.label.length>34? d.label.slice(0,33)+'…':d.label;
+    s+=`<rect class="barbg" x="${padL}" y="${y}" width="${bw}" height="${rowH}" rx="4"/>`;
+    s+=`<rect class="bar" x="${padL}" y="${y}" width="${w}" height="${rowH}" rx="4"><title>${esc(d.label)}: ${d.value}</title></rect>`;
+    s+=`<text class="axislbl" x="${padL-8}" y="${y+rowH/2+4}" text-anchor="end">${esc(label)}</text>`;
+    s+=`<text class="vallbl" x="${padL+w+6}" y="${y+rowH/2+4}">${d.value}</text>`;
+  });
+  s+='</svg>'; el.innerHTML=s;
+}
+function vbar(el, data, cap){
+  cap.textContent = data.length? '' : 'No data';
+  if(!data.length){ el.innerHTML=''; return; }
+  const W=560, H=200, padB=40, padT=16, padL=26, padR=8;
+  const n=data.length, max=Math.max(1,...data.map(d=>d.value));
+  const plotW=W-padL-padR, plotH=H-padT-padB;
+  const step=plotW/n, bw=Math.max(4, Math.min(46, step*0.62));
+  const showEvery=Math.ceil(n/12);
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Meetings over time">`;
+  // gridlines (0, mid, max)
+  [0,0.5,1].forEach(f=>{ const y=padT+plotH*(1-f); const v=Math.round(max*f);
+    s+=`<line class="gridline" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
+    s+=`<text class="axislbl" x="${padL-4}" y="${y+3}" text-anchor="end">${v}</text>`; });
+  data.forEach((d,i)=>{
+    const x=padL+step*i+(step-bw)/2;
+    const h=Math.max(2, plotH*d.value/max);
+    const y=padT+plotH-h;
+    s+=`<rect class="bar" x="${x}" y="${y}" width="${bw}" height="${h}" rx="4"><title>${esc(d.label)}: ${d.value} meeting(s)</title></rect>`;
+    if(i%showEvery===0){ s+=`<text class="axislbl" x="${x+bw/2}" y="${H-padB+16}" text-anchor="middle" transform="rotate(35 ${x+bw/2} ${H-padB+16})">${esc(d.label.slice(5))}</text>`; }
+  });
+  s+='</svg>'; el.innerHTML=s;
+}
+function renderCharts(ms){
+  const byHost=new Map();
+  ms.forEach(m=>byHost.set(m.host,(byHost.get(m.host)||0)+1));
+  const hostData=[...byHost.entries()].map(([label,value])=>({label,value})).sort((a,b)=>b.value-a.value).slice(0,15);
+  hbar($('#hostsChart'), hostData, $('#hostsCap'));
+  const byDate=new Map();
+  ms.forEach(m=>{ if(m.date) byDate.set(m.date,(byDate.get(m.date)||0)+1); });
+  const timeData=[...byDate.entries()].map(([label,value])=>({label,value})).sort((a,b)=>a.label<b.label?-1:1);
+  vbar($('#timeChart'), timeData, $('#timeCap'));
+}
+
+/* ---------- table ---------- */
+function currentFiltered(){
+  const q=$('#q').value.trim().toLowerCase();
+  const host=$('#hostSel').value;
+  const from=$('#from').value, to=$('#to').value;
+  let ms=MEETINGS.filter(m=>{
+    if(host && m.host!==host) return false;
+    if(from && m.date && m.date<from) return false;
+    if(to && m.date && m.date>to) return false;
+    if(q){
+      let hay=(m.host+' '+m.subject).toLowerCase();
+      if(!hay.includes(q)){
+        let hit=false;
+        for(const p of m.parts){ if((p.name+' '+p.email).toLowerCase().includes(q)){hit=true;break;} }
+        if(!hit) return false;
+      }
+    }
+    return true;
+  });
+  const dir=sortDir;
+  ms=ms.slice().sort((a,b)=>{
+    let x=a[sortKey], y=b[sortKey];
+    if(sortKey==='dur'||sortKey==='pcount'){ x=isNaN(x)?-1:x; y=isNaN(y)?-1:y; return (x-y)*dir; }
+    x=String(x||'').toLowerCase(); y=String(y||'').toLowerCase();
+    return (x<y?-1:x>y?1:0)*dir;
+  });
+  return ms;
+}
+function renderTable(){
+  const ms=currentFiltered();
+  const tb=$('#tbody'); tb.innerHTML='';
+  $('#tblEmpty').classList.toggle('hidden', ms.length>0);
+  $('#count').textContent = ms.length+' meeting'+(ms.length===1?'':'s')+' shown'+(ms.length!==MEETINGS.length? ' (of '+MEETINGS.length+')':'');
+  ms.forEach((m,idx)=>{
+    const tr=document.createElement('tr'); tr.className='meeting';
+    tr.innerHTML=`<td><span class="chev">▶</span> ${esc(m.host)}</td>`+
+      `<td class="topic">${esc(m.subject)}</td>`+
+      `<td class="num">${esc(m.date)}</td>`+
+      `<td class="num">${esc(m.time)}</td>`+
+      `<td class="num">${esc(m.durTxt)}</td>`+
+      `<td class="num">${m.pcount}</td>`;
+    const det=document.createElement('tr'); det.className='detail'+(expandAll?'':' hidden');
+    if(expandAll) tr.classList.add('open');
+    det.innerHTML=`<td colspan="6">${partTable(m)}</td>`;
+    tr.addEventListener('click',()=>{ det.classList.toggle('hidden'); tr.classList.toggle('open'); });
+    tb.appendChild(tr); tb.appendChild(det);
+  });
+  document.querySelectorAll('#tbl > thead th').forEach(th=>{
+    const k=th.dataset.k, a=th.querySelector('.arrow');
+    if(a) a.textContent = (k===sortKey)? (sortDir===1?'▲':'▼') : '';
+  });
+}
+function partTable(m){
+  if(!m.parts.length) return '<div class="empty">No participant records for this meeting.</div>';
+  const showTimes=m.hasMin;
+  let h='<table class="ptable"><thead><tr><th>#</th><th>Name</th><th>Email</th><th>Role</th>'+
+    (showTimes?'<th>Join</th><th>Leave</th><th>Min</th>':'')+'</tr></thead><tbody>';
+  m.parts.forEach((p,i)=>{
+    h+=`<tr><td class="num">${i+1}</td><td>${esc(p.name)}</td><td>${esc(p.email||'Guest')}</td>`+
+       `<td>${p.role?('<span class="role">'+esc(p.role)+'</span>'):''}</td>`+
+       (showTimes?`<td class="num">${esc(timePart(p.join))}</td><td class="num">${esc(timePart(p.leave))}</td><td class="num">${isNaN(p.min)?'':Math.round(p.min)}</td>`:'')+
+       `</tr>`;
+  });
+  return h+'</tbody></table>';
+}
+
+/* ---------- export ---------- */
+function exportCSV(){
+  const ms=currentFiltered();
+  const rows=[['Host','Topic','Date','Start','Duration','Participant Count','Participants']];
+  ms.forEach(m=>{
+    const plist=[...m.parts].map(p=> p.email&&p.name&&p.email!==p.name? (p.name+' <'+p.email+'>') : (p.name||p.email)).join('; ');
+    rows.push([m.host,m.subject,m.date,m.time,m.durTxt,String(m.pcount),plist]);
+  });
+  const csv=rows.map(r=>r.map(c=>{ c=String(c==null?'':c); return /[",\n]/.test(c)? '"'+c.replace(/"/g,'""')+'"':c; }).join(',')).join('\r\n');
+  const blob=new Blob(['﻿'+csv],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='TeamsAttendance_summary.csv'; document.body.appendChild(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},100);
+}
+
+/* ---------- report branding + print report ---------- */
+const BRAND = { left:'', right:'', size:48, valign:'top', title:'', sub:'', footer:'' };
+function loadBrand(){ try{ const s=localStorage.getItem('tad_brand'); if(s) Object.assign(BRAND, JSON.parse(s)); }catch(e){} }
+function saveBrand(){ try{ localStorage.setItem('tad_brand', JSON.stringify(BRAND)); }catch(e){} }
+
+function buildPrintArea(){
+  const ms = currentFiltered();
+  const host=$('#hostSel').value||'All hosts';
+  const from=$('#from').value, to=$('#to').value, q=$('#q').value.trim();
+  const ctx=['Host: '+host];
+  if(from||to) ctx.push('Dates: '+(from||'…')+' → '+(to||'…'));
+  if(q) ctx.push('Search: "'+q+'"');
+  // KPIs
+  const hosts=new Set(ms.map(m=>m.host)); const emails=new Set(); let totMin=0, anyMin=false;
+  ms.forEach(m=>m.parts.forEach(p=>{ emails.add((p.email||p.name).toLowerCase()); if(!isNaN(p.min)){totMin+=p.min; anyMin=true;} }));
+  const kpi = `<b>${ms.length}</b> meetings &nbsp;·&nbsp; <b>${hosts.size}</b> hosts &nbsp;·&nbsp; <b>${emails.size}</b> unique participants`
+    + (anyMin?` &nbsp;·&nbsp; <b>${(totMin/60).toFixed(1)}</b> participant-hours`:'');
+  const lLogo = BRAND.left ? `<img class="rpt-logo" src="${BRAND.left}" style="height:${BRAND.size}px">` : '';
+  const rLogo = BRAND.right? `<img class="rpt-logo" src="${BRAND.right}" style="height:${BRAND.size}px">` : '';
+  let html = `<div class="rpt-header ${BRAND.valign==='middle'?'vmid':''}">${lLogo}<div class="rpt-titles">`+
+    `<div class="rpt-title">${esc(BRAND.title||'Teams Attendance Report')}</div>`+
+    (BRAND.sub?`<div class="rpt-sub">${esc(BRAND.sub)}</div>`:'')+
+    `<div class="rpt-meta">${esc(ctx.join('  ·  '))}</div>`+
+    `<div class="rpt-meta">Source: ${esc(FILE_NAME||'—')} · Generated: ${esc(new Date().toLocaleString())}</div>`+
+    `</div>${rLogo}</div>`;
+  html += `<div class="rpt-kpis">${kpi}</div>`;
+  const showTimes = ms.length? ms[0].hasMin : true;
+  const cols = showTimes ? 7 : 4;
+  ms.forEach(m=>{
+    html += `<table class="mtg"><thead>`+
+      `<tr class="msum"><th colspan="${cols}">`+
+        `<span class="r">${esc(m.date)} ${esc(m.time)} · ${esc(m.durTxt||'')} · ${m.pcount} participant(s)</span>`+
+        `<span class="l">${esc(m.host)}</span>`+
+        `<div style="font-weight:400;font-size:11px;color:#333">${esc(m.subject)}</div>`+
+      `</th></tr>`+
+      `<tr class="phead"><th class="n">#</th><th>Name</th><th>Email</th><th>Role</th>`+
+      (showTimes?`<th>Join</th><th>Leave</th><th class="n">Min</th>`:'')+`</tr></thead><tbody>`;
+    if(!m.parts.length){
+      html += `<tr><td colspan="${cols}" style="text-align:center;color:#777">No participant records.</td></tr>`;
+    } else {
+      m.parts.forEach((p,i)=>{
+        html += `<tr><td class="n">${i+1}</td><td>${esc(p.name)}</td><td>${esc(p.email||'Guest')}</td><td>${esc(p.role||'')}</td>`+
+          (showTimes?`<td>${esc(timePart(p.join))}</td><td>${esc(timePart(p.leave))}</td><td class="n">${isNaN(p.min)?'':Math.round(p.min)}</td>`:'')+`</tr>`;
+      });
+    }
+    html += `</tbody></table>`;
+  });
+  $('#printArea').innerHTML = html;
+  $('#rptFooter').innerHTML = `<span>${esc(BRAND.footer||'')}</span><span>${esc(BRAND.title||'')}${BRAND.title?' · ':''}Generated ${esc(new Date().toLocaleDateString())}</span>`;
+}
+
+/* ---------- Word (.docx) export — vanilla OOXML, no libraries (stays offline) ---------- */
+const _crcT=(()=>{const t=[];for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);t[n]=c>>>0;}return t;})();
+function _crc32(b){let c=0xFFFFFFFF;for(let i=0;i<b.length;i++)c=_crcT[(c^b[i])&0xFF]^(c>>>8);return (c^0xFFFFFFFF)>>>0;}
+function _zip(files){
+  const parts=[],cen=[]; let off=0;
+  const u16=n=>[n&255,(n>>8)&255], u32=n=>[n&255,(n>>8)&255,(n>>16)&255,(n>>24)&255];
+  files.forEach(f=>{
+    const nm=new TextEncoder().encode(f.name), d=f.data, crc=_crc32(d);
+    const lh=[0x50,0x4b,0x03,0x04,...u16(20),...u16(0),...u16(0),...u16(0),...u16(0),...u32(crc),...u32(d.length),...u32(d.length),...u16(nm.length),...u16(0)];
+    parts.push(new Uint8Array(lh),nm,d);
+    const ch=[0x50,0x4b,0x01,0x02,...u16(20),...u16(20),...u16(0),...u16(0),...u16(0),...u16(0),...u32(crc),...u32(d.length),...u32(d.length),...u16(nm.length),...u16(0),...u16(0),...u16(0),...u16(0),...u32(0),...u32(off)];
+    cen.push({h:new Uint8Array(ch),nm}); off+=lh.length+nm.length+d.length;
+  });
+  let cs=0; const cp=[]; cen.forEach(c=>{cp.push(c.h,c.nm); cs+=c.h.length+c.nm.length;});
+  const end=[0x50,0x4b,0x05,0x06,...u16(0),...u16(0),...u16(files.length),...u16(files.length),...u32(cs),...u32(off),...u16(0)];
+  return new Blob([...parts,...cp,new Uint8Array(end)],{type:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'});
+}
+const _te=s=>new TextEncoder().encode(s);
+function _xe(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c])); }
+function _b64bytes(u){ const b=atob(u.slice(u.indexOf(',')+1)); const a=new Uint8Array(b.length); for(let i=0;i<b.length;i++)a[i]=b.charCodeAt(i); return a; }
+function _imgSize(u){ return new Promise(res=>{ const im=new Image(); im.onload=()=>res({w:im.naturalWidth||1,h:im.naturalHeight||1}); im.onerror=()=>res({w:1,h:1}); im.src=u; }); }
+function _p(text,o){ o=o||{}; const rpr=`<w:rPr>${o.bold?'<w:b/>':''}${o.color?`<w:color w:val="${o.color}"/>`:''}${o.size?`<w:sz w:val="${o.size}"/>`:''}</w:rPr>`;
+  const ppr=`<w:pPr>${o.align?`<w:jc w:val="${o.align}"/>`:''}${o.after!=null?`<w:spacing w:after="${o.after}"/>`:''}${o.border?'<w:pBdr><w:top w:val="single" w:sz="4" w:space="4" w:color="CCCCCC"/></w:pBdr>':''}</w:pPr>`;
+  return `<w:p>${ppr}<w:r>${rpr}<w:t xml:space="preserve">${_xe(text)}</w:t></w:r></w:p>`; }
+function _drawing(rid,id,cx,cy){ return `<w:p><w:pPr><w:jc w:val="${id===1?'left':'right'}"/></w:pPr><w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="${cx}" cy="${cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="${id}" name="logo${id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect="1"/></wp:cNvGraphicFramePr><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr><pic:cNvPr id="${id}" name="logo${id}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="${rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>`; }
+
+async function exportDocx(){
+  const ms=currentFiltered();
+  if(!ms.length){ alert('Nothing to export for the current filter.'); return; }
+  const showTimes = ms[0].hasMin;
+  const heads = showTimes? ['#','Name','Email','Role','Join','Leave','Min'] : ['#','Name','Email','Role'];
+  const widths= showTimes? [520,2200,3760,1400,1000,1000,920] : [520,3000,5880,1400];
+  const cols=heads.length, totalW=widths.reduce((a,b)=>a+b,0);
+  const media=[], rels=[]; let rid=0;
+  // logos (embed as images)
+  async function logoDrawing(dataUrl, id){
+    if(!dataUrl) return '';
+    const mime=(/^data:([^;]+)/.exec(dataUrl)||[])[1]||'image/png';
+    const ext = mime.indexOf('png')>=0?'png':(mime.indexOf('jpeg')>=0||mime.indexOf('jpg')>=0?'jpeg':'png');
+    rid++; const rId='rIdImg'+rid; const fn='media/logo'+rid+'.'+ext;
+    media.push({name:'word/'+fn, data:_b64bytes(dataUrl)});
+    rels.push(`<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="${fn}"/>`);
+    const s=await _imgSize(dataUrl); const hPx=BRAND.size||48, wPx=Math.max(8, Math.round(hPx*(s.w/s.h)));
+    return _drawing(rId, id, wPx*9525, hPx*9525);
+  }
+  const lD = await logoDrawing(BRAND.left,1);
+  const rD = await logoDrawing(BRAND.right,2);
+
+  // header (branding)
+  const host=$('#hostSel').value||'All hosts', from=$('#from').value, to=$('#to').value, q=$('#q').value.trim();
+  const ctx=['Host: '+host]; if(from||to) ctx.push('Dates: '+(from||'…')+' → '+(to||'…')); if(q) ctx.push('Search: "'+q+'"');
+  const hostsN=new Set(ms.map(m=>m.host)); const em=new Set(); let tm=0,anyMin=false;
+  ms.forEach(m=>m.parts.forEach(p=>{em.add((p.email||p.name).toLowerCase()); if(!isNaN(p.min)){tm+=p.min;anyMin=true;}}));
+  const kpiTxt = `${ms.length} meetings · ${hostsN.size} hosts · ${em.size} unique participants`+(anyMin?` · ${(tm/60).toFixed(1)} participant-hours`:'');
+  const titles = _p(BRAND.title||'Teams Attendance Report',{bold:true,size:32,align:'center',after:20})
+    + (BRAND.sub?_p(BRAND.sub,{size:24,align:'center',color:'333333',after:20}):'')
+    + _p(ctx.join('   ·   '),{size:18,align:'center',color:'555555',after:0})
+    + _p('Source: '+(FILE_NAME||'—')+' · Generated: '+new Date().toLocaleString(),{size:16,align:'center',color:'777777',after:60});
+  let header;
+  if(lD||rD){
+    const nilB='<w:tcBorders><w:top w:val="nil"/><w:left w:val="nil"/><w:bottom w:val="nil"/><w:right w:val="nil"/></w:tcBorders>';
+    header=`<w:tbl><w:tblPr><w:tblW w:w="${totalW}" w:type="dxa"/><w:tblBorders><w:top w:val="nil"/><w:left w:val="nil"/><w:bottom w:val="nil"/><w:right w:val="nil"/><w:insideH w:val="nil"/><w:insideV w:val="nil"/></w:tblBorders><w:tblLook w:val="0000"/></w:tblPr>`+
+      `<w:tblGrid><w:gridCol w:w="2200"/><w:gridCol w:w="${totalW-4400}"/><w:gridCol w:w="2200"/></w:tblGrid><w:tr>`+
+      `<w:tc><w:tcPr><w:tcW w:w="2200" w:type="dxa"/>${nilB}<w:vAlign w:val="${BRAND.valign==='middle'?'center':'top'}"/></w:tcPr>${lD||'<w:p/>'}</w:tc>`+
+      `<w:tc><w:tcPr><w:tcW w:w="${totalW-4400}" w:type="dxa"/>${nilB}<w:vAlign w:val="center"/></w:tcPr>${titles}</w:tc>`+
+      `<w:tc><w:tcPr><w:tcW w:w="2200" w:type="dxa"/>${nilB}<w:vAlign w:val="${BRAND.valign==='middle'?'center':'top'}"/></w:tcPr>${rD||'<w:p/>'}</w:tc>`+
+      `</w:tr></w:tbl>`+_p('',{after:40});
+  } else { header=titles; }
+  header += _p(kpiTxt,{bold:false,size:18,color:'333333',after:120});
+
+  // meeting tables
+  const bord='<w:tblBorders>'+['top','left','bottom','right','insideH','insideV'].map(s=>`<w:${s} w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>`).join('')+'</w:tblBorders>';
+  function th(txt,w){ return `<w:tc><w:tcPr><w:tcW w:w="${w}" w:type="dxa"/><w:shd w:val="clear" w:fill="F2F2F2"/></w:tcPr>${_p(txt,{bold:true,size:16})}</w:tc>`; }
+  function td(txt,w){ return `<w:tc><w:tcPr><w:tcW w:w="${w}" w:type="dxa"/></w:tcPr>${_p(txt,{size:18})}</w:tc>`; }
+  let body='';
+  ms.forEach(m=>{
+    const summary=`<w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:tcPr><w:tcW w:w="${totalW}" w:type="dxa"/><w:gridSpan w:val="${cols}"/><w:shd w:val="clear" w:fill="EEF2F7"/></w:tcPr>`+
+      _p(m.host,{bold:true,size:22,after:0})+
+      _p(`${m.subject} — ${m.date} ${m.time} · ${m.durTxt||''} · ${m.pcount} participant(s)`,{size:16,color:'333333',after:0})+
+      `</w:tc></w:tr>`;
+    const hdr=`<w:tr><w:trPr><w:tblHeader/></w:trPr>${heads.map((h,i)=>th(h,widths[i])).join('')}</w:tr>`;
+    let rows='';
+    if(!m.parts.length){ rows=`<w:tr><w:tc><w:tcPr><w:tcW w:w="${totalW}" w:type="dxa"/><w:gridSpan w:val="${cols}"/></w:tcPr>${_p('No participant records.',{size:16,color:'777777'})}</w:tc></w:tr>`; }
+    else m.parts.forEach((p,i)=>{
+      const c=[String(i+1),p.name||'',p.email||'Guest',p.role||''];
+      if(showTimes) c.push(timePart(p.join),timePart(p.leave),isNaN(p.min)?'':String(Math.round(p.min)));
+      rows+=`<w:tr>${c.map((v,j)=>td(v,widths[j])).join('')}</w:tr>`;
+    });
+    body+=`<w:tbl><w:tblPr><w:tblW w:w="${totalW}" w:type="dxa"/>${bord}<w:tblLook w:val="04A0"/></w:tblPr><w:tblGrid>${widths.map(w=>`<w:gridCol w:w="${w}"/>`).join('')}</w:tblGrid>${summary}${hdr}${rows}</w:tbl>`+_p('',{after:120});
+  });
+  if(BRAND.footer||true) body+=_p((BRAND.footer||'')+(BRAND.footer?'    ':'')+'Generated '+new Date().toLocaleDateString(),{size:15,color:'777777',border:true});
+
+  const docXml=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`+
+    `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>`+
+    header+body+
+    `<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr></w:body></w:document>`;
+  const ct=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`;
+  const rootRels=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`;
+  const docRels=`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${rels.join('')}</Relationships>`;
+  const files=[
+    {name:'[Content_Types].xml', data:_te(ct)},
+    {name:'_rels/.rels', data:_te(rootRels)},
+    {name:'word/document.xml', data:_te(docXml)},
+    {name:'word/_rels/document.xml.rels', data:_te(docRels)},
+    ...media
+  ];
+  const blob=_zip(files);
+  const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+  a.download='TeamsAttendance_report.docx'; document.body.appendChild(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},150);
+}
+
+/* ---------- load ---------- */
+function load(text, fname){
+  const parsed=parseCSV(text);
+  if(!parsed.data.length){ alert('No data rows found in this CSV.'); return; }
+  MEETINGS=buildMeetings(parsed);
+  HAS_MIN = MEETINGS.length? MEETINGS[0].hasMin : true;
+  const type=detectType(parsed.headers);
+  $('#warn').classList.toggle('hidden', type!=='wide');
+  if(type==='wide') $('#warn').textContent='Wide CSV detected — participant emails are shown, but names, roles and join/leave times aren\'t in that file. Upload TeamsAttendance_*.csv for full detail.';
+  // host dropdown
+  const hosts=[...new Set(MEETINGS.map(m=>m.host))].sort();
+  $('#hostSel').innerHTML='<option value="">All hosts</option>'+hosts.map(h=>`<option value="${esc(h)}">${esc(h)}</option>`).join('');
+  FILE_NAME=fname||'';
+  $('#fileinfo').textContent=fname? (fname+' · '+MEETINGS.length+' meetings') : '';
+  $('#drop').classList.add('hidden'); $('#dash').classList.remove('hidden'); $('#reloadBtn').classList.remove('hidden');
+  renderKPIs(MEETINGS); renderCharts(MEETINGS); renderTable();
+}
+
+/* ---------- wire up ---------- */
+function handleFiles(files){ const f=files&&files[0]; if(!f) return; const r=new FileReader(); r.onload=e=>load(e.target.result, f.name); r.readAsText(f); }
+$('#file').addEventListener('change', e=>handleFiles(e.target.files));
+const drop=$('#drop');
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('drag');}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('drag');}));
+drop.addEventListener('drop',e=>handleFiles(e.dataTransfer.files));
+$('#q').addEventListener('input',renderTable);
+$('#hostSel').addEventListener('change',renderTable);
+$('#from').addEventListener('change',renderTable);
+$('#to').addEventListener('change',renderTable);
+$('#clearBtn').addEventListener('click',()=>{ $('#q').value='';$('#hostSel').value='';$('#from').value='';$('#to').value=''; renderTable(); });
+$('#exportBtn').addEventListener('click',exportCSV);
+$('#expandBtn').addEventListener('click',()=>{ expandAll=!expandAll; $('#expandBtn').textContent = expandAll?'⊖ Collapse all':'⊕ Expand all'; renderTable(); });
+$('#printBtn').addEventListener('click',()=>{ buildPrintArea(); window.print(); });
+$('#docxBtn').addEventListener('click',()=>{ exportDocx().catch(e=>alert('Word export failed: '+e.message)); });
+
+/* report-branding options panel */
+$('#optsBtn').addEventListener('click',()=> $('#optsPanel').classList.toggle('show'));
+function setPrev(imgId,clrId,data){ const img=$('#'+imgId), clr=$('#'+clrId); if(data){ img.src=data; img.classList.remove('hidden'); clr.classList.remove('hidden'); } else { img.removeAttribute('src'); img.classList.add('hidden'); clr.classList.add('hidden'); } }
+function syncOptInputs(){
+  $('#optTitle').value=BRAND.title||''; $('#optSub').value=BRAND.sub||''; $('#optFooter').value=BRAND.footer||'';
+  $('#optSize').value=BRAND.size||48; $('#sizeVal').textContent=(BRAND.size||48)+'px'; $('#optValign').value=BRAND.valign||'top';
+  setPrev('prevLeft','clrLeft',BRAND.left); setPrev('prevRight','clrRight',BRAND.right);
+}
+function readLogo(input, side){ const f=input.files&&input.files[0]; if(!f) return; const r=new FileReader(); r.onload=ev=>{ BRAND[side]=ev.target.result; saveBrand(); syncOptInputs(); }; r.readAsDataURL(f); }
+$('#optTitle').addEventListener('input',e=>{ BRAND.title=e.target.value; saveBrand(); });
+$('#optSub').addEventListener('input',e=>{ BRAND.sub=e.target.value; saveBrand(); });
+$('#optFooter').addEventListener('input',e=>{ BRAND.footer=e.target.value; saveBrand(); });
+$('#optSize').addEventListener('input',e=>{ BRAND.size=+e.target.value; $('#sizeVal').textContent=BRAND.size+'px'; saveBrand(); });
+$('#optValign').addEventListener('change',e=>{ BRAND.valign=e.target.value; saveBrand(); });
+$('#optLeft').addEventListener('change',e=>readLogo(e.target,'left'));
+$('#optRight').addEventListener('change',e=>readLogo(e.target,'right'));
+$('#clrLeft').addEventListener('click',()=>{ BRAND.left=''; saveBrand(); $('#optLeft').value=''; syncOptInputs(); });
+$('#clrRight').addEventListener('click',()=>{ BRAND.right=''; saveBrand(); $('#optRight').value=''; syncOptInputs(); });
+loadBrand(); syncOptInputs();
+$('#reloadBtn').addEventListener('click',()=>{ $('#dash').classList.add('hidden'); $('#drop').classList.remove('hidden'); $('#file').value=''; $('#fileinfo').textContent=''; MEETINGS=[]; });
+document.querySelectorAll('#tbl > thead th').forEach(th=>th.addEventListener('click',()=>{
+  const k=th.dataset.k; if(k===sortKey) sortDir=-sortDir; else{ sortKey=k; sortDir=(k==='date'?-1:1); } renderTable();
+}));
+$('#themeBtn').addEventListener('click',()=>{
+  const cur=document.documentElement.getAttribute('data-theme');
+  const next = cur==='dark'?'light': cur==='light'?'':'dark';
+  if(next) document.documentElement.setAttribute('data-theme',next); else document.documentElement.removeAttribute('data-theme');
+});
+</script>
+</body>
+</html>
